@@ -1,0 +1,27 @@
+{
+  "$schema": "https://modelcontextprotocol.io/schema/mcp.json",
+  "mcpServers": {
+    "ida-pro-mcp-plus": {
+      "command": "python",
+      "args": [
+        "ida-pro-mcp-server.py"
+      ],
+      "env": {
+        "IDA64_PATH": "",
+        "IDAT64_PATH": "",
+        "I64_CACHE_DIR": ".i64_cache",
+        "IDA_TIMEOUT": "120",
+        "IDA_SHM_SIZE": "20971520"
+      },
+      "description": "Enhanced IDA Pro MCP server with 34 tools for automated reverse engineering"
+    }
+  },
+  "_comments": {
+    "setup": "Run 'python setup_mcp.py' for one-click configuration",
+    "IDA64_PATH": "Path to ida.exe or ida64.exe",
+    "IDAT64_PATH": "Path to idat.exe or idat64.exe (headless version)",
+    "I64_CACHE_DIR": "Directory for .i64 database cache (default: .i64_cache)",
+    "IDA_TIMEOUT": "Timeout in seconds for IDA script execution (default: 120)",
+    "IDA_SHM_SIZE": "Shared memory size in bytes (default: 20971520 = 20MB)"
+  }
+}
