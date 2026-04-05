@@ -592,12 +592,22 @@ else:
             result["success"] = False
             result["error"] = "Unable to read any bytes from address"
     else:
+        result["bytes"] = data.hex()
+        result["address"] = hex(TARGET_EA)
+        result["requested_size"] = READ_SIZE
+        result["actual_size"] = len(data)
+
 with open(SHARED_MEM_PATH, "r+b") as handle:
     with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_WRITE) as mm:
         mm.write(json.dumps(result, ensure_ascii=False).encode("utf-8"))
 
 idc.qexit(0)
 """
+    return script_template % {
+        "shm_path": shm_path,
+        "address": address,
+        "size": size,
+    }
 
 
 # ============================================================================

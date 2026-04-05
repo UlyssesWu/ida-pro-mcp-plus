@@ -643,14 +643,17 @@ def list_imports(
 @mcp.tool()
 def xrefs_to(
     file_path: Annotated[str, "Target binary file path"],
-    addresses: Annotated[str, "Comma-separated hex addresses (e.g. 0x401000,0x402000)"],
+    addresses: Annotated[
+        str,
+        "Comma-separated EAs (hex with 0x or decimal), e.g. '0x401000,0x402000' or '4198400,4206592'",
+    ],
 ) -> str:
     """
     Find cross-references to one or more addresses.
 
     Args:
         file_path: Target binary file path
-        addresses: Comma-separated hex addresses
+        addresses: Comma-separated addresses (hex or decimal)
 
     Returns:
         JSON string with xrefs grouped by target address
@@ -943,14 +946,17 @@ def find_regex(
 @mcp.tool()
 def lookup_funcs(
     file_path: Annotated[str, "Target binary file path"],
-    queries: Annotated[list[str], "Function names or addresses to look up"],
+    queries: Annotated[
+        list[str],
+        "Each entry: function name (e.g. 'sub_401000') or EA string ('0x401000' / decimal). Batch metadata lookup.",
+    ],
 ) -> str:
     """
     Batch lookup functions by name or address.
 
     Args:
         file_path: Target binary file path
-        queries: List of function names or addresses
+        queries: Function names or address strings
 
     Returns:
         JSON string with function metadata for each query
@@ -1013,13 +1019,17 @@ def list_globals(
 
 @mcp.tool()
 def int_convert(
-    numbers: Annotated[list[dict], "Numbers to convert with 'text' and optional 'size' fields"],
+    numbers: Annotated[
+        list[dict],
+        "Each dict: text (integer string, int(text,0): 0x.., decimal, 0b..), optional size 8|16|32|64 "
+        "(masks value to that bit width; default 64).",
+    ],
 ) -> str:
     """
     Convert numbers between hex, decimal, binary, and ASCII formats.
 
     Args:
-        numbers: List of dicts with 'text' (number string) and optional 'size' (8/16/32/64)
+        numbers: List of dicts with 'text' and optional 'size'
 
     Returns:
         JSON string with conversions
@@ -1065,14 +1075,18 @@ def int_convert(
 @mcp.tool()
 def get_int(
     file_path: Annotated[str, "Target binary file path"],
-    queries: Annotated[list[dict], "Read requests with 'addr' and 'ty' (e.g. 'i32le', 'u64be')"],
+    queries: Annotated[
+        list[dict],
+        "Each dict: addr (hex/dec string), ty (i8|u8|i16|u16|i32|u32|i64|u64 + optional le|be, default le), "
+        "e.g. 'u32le', 'i64be'.",
+    ],
 ) -> str:
     """
     Read typed integers from memory.
 
     Args:
         file_path: Target binary file path
-        queries: List of dicts with 'addr' (address) and 'ty' (type string)
+        queries: List of dicts with 'addr' and 'ty' (endian-sized integer format)
 
     Returns:
         JSON string with integer values
@@ -1096,14 +1110,17 @@ def get_int(
 @mcp.tool()
 def get_string(
     file_path: Annotated[str, "Target binary file path"],
-    addresses: Annotated[list[str], "String addresses to read"],
+    addresses: Annotated[
+        list[str],
+        "Each string is an EA (hex with 0x or decimal). Reads a C-style null-terminated string at that address.",
+    ],
 ) -> str:
     """
     Read null-terminated strings from memory.
 
     Args:
         file_path: Target binary file path
-        addresses: List of addresses (hex or decimal strings)
+        addresses: List of address strings
 
     Returns:
         JSON string with string values
@@ -1127,14 +1144,17 @@ def get_string(
 @mcp.tool()
 def get_global_value(
     file_path: Annotated[str, "Target binary file path"],
-    names: Annotated[list[str], "Global variable names"],
+    names: Annotated[
+        list[str],
+        "IDA public names for globals (as in the Names list), e.g. 'dword_403000', 'g_Initialized'.",
+    ],
 ) -> str:
     """
     Read global variable values by name.
 
     Args:
         file_path: Target binary file path
-        names: List of global variable names
+        names: Global symbol names known to IDA
 
     Returns:
         JSON string with variable values
@@ -1158,14 +1178,17 @@ def get_global_value(
 @mcp.tool()
 def patch(
     file_path: Annotated[str, "Target binary file path"],
-    patches: Annotated[list[dict], "Patch operations with 'addr' and 'bytes' (hex string)"],
+    patches: Annotated[
+        list[dict],
+        "Each dict: addr (hex/dec EA string), bytes (space-separated hex byte tokens, e.g. '90 90 C3').",
+    ],
 ) -> str:
     """
     Patch memory with arbitrary bytes.
 
     Args:
         file_path: Target binary file path
-        patches: List of dicts with 'addr' (address) and 'bytes' (hex string like "90 90 90")
+        patches: List of dicts with 'addr' and 'bytes' (space-separated hex)
 
     Returns:
         JSON string with patch results
@@ -1189,14 +1212,17 @@ def patch(
 @mcp.tool()
 def put_int(
     file_path: Annotated[str, "Target binary file path"],
-    writes: Annotated[list[dict], "Write operations with 'addr', 'ty', and 'value'"],
+    writes: Annotated[
+        list[dict],
+        "Each dict: addr (hex/dec), ty (same as get_int: u32le, i64be, ...), value (integer or hex string like '0x10').",
+    ],
 ) -> str:
     """
     Write typed integers to memory.
 
     Args:
         file_path: Target binary file path
-        writes: List of dicts with 'addr', 'ty' (type like "i32le"), and 'value'
+        writes: List of dicts with 'addr', 'ty', and 'value'
 
     Returns:
         JSON string with write results
@@ -1218,14 +1244,23 @@ def put_int(
 
 
 # ============================================================================
-# Category 4-6: Placeholder Tools (TODO: Implement fully)
+# Category 4-6: Modification, stack, and type tools
 # ============================================================================
-# These tools return "not implemented" errors.
-# See implementation guide in IMPLEMENTATION_GUIDE.md
 
 @mcp.tool()
-def set_comments(file_path: str, items: list[dict]) -> str:
-    """Set comments at addresses (placeholder - basic implementation only)."""
+def set_comments(
+    file_path: Annotated[str, "Target binary file path (opens/creates cached .i64 like other tools)"],
+    items: Annotated[
+        list[dict],
+        "Each dict: addr (hex/dec string, e.g. '0x401000'), comment (plain text). "
+        "Sets a disassembly comment at that EA via idc.set_cmt (repeatable comment flag 0).",
+    ],
+) -> str:
+    """
+    Set disassembly comments at explicit addresses.
+
+    Does not set decompiler-only comments; each item maps one EA to one string.
+    """
     try:
         _setup_logging()
         _ensure_paths()
@@ -1238,8 +1273,19 @@ def set_comments(file_path: str, items: list[dict]) -> str:
         return json.dumps({"success": False, "error": str(e)}, indent=2)
 
 @mcp.tool()
-def patch_asm(file_path: str, items: list[dict]) -> str:
-    """Patch assembly instructions."""
+def patch_asm(
+    file_path: Annotated[str, "Target binary file path"],
+    items: Annotated[
+        list[dict],
+        "Each dict: addr (hex/dec string or int EA), asm (single instruction text as IDA accepts, "
+        "e.g. 'nop' or 'mov rax, 1'). Uses idautils.Assemble then patch_byte per emitted byte.",
+    ],
+) -> str:
+    """
+    Assemble instructions in-place at given addresses.
+
+    One list item = one instruction at one address. If assembly fails, that item returns an error in results.
+    """
     try:
         _setup_logging()
         _ensure_paths()
@@ -1252,8 +1298,52 @@ def patch_asm(file_path: str, items: list[dict]) -> str:
         return json.dumps({"success": False, "error": str(e)}, indent=2)
 
 @mcp.tool()
-def rename(file_path: str, batch: dict) -> str:
-    """Unified rename operation."""
+def rename(
+    file_path: Annotated[str, "Target binary file path"],
+    batch: Annotated[
+        dict,
+        "Batch spec: optional keys funcs, globals, locals, stack_vars (see long description). "
+        "Omitted keys are treated as empty.",
+    ],
+) -> str:
+    """
+    Batch-rename functions, globals, Hex-Rays locals, or stack frame members in the IDB.
+
+    Pass **one JSON object** with any of these optional array fields:
+
+    **funcs** — rename a function (symbol at function start).
+    Each element: `{"old": "<name|0xaddress>", "new": "<new name>"}`.
+    `old` is resolved with `get_name_ea_simple` unless it starts with `0x`, then parsed as hex.
+
+    **globals** — rename a global label / named data (same `old` / `new` shape as funcs).
+
+    **locals** — rename a **decompiler local variable** inside one function.
+    Each element: `{"func": "<function name|0xaddress>", "old": "<current lvar name>", "new": "<new name>"}`.
+    Requires Hex-Rays decompilation; `old` must match the local name shown in pseudocode.
+
+    **stack_vars** — rename a **stack frame member** (debugger/stack view name).
+    Same shape as locals: `func`, `old`, `new`. Uses frame members, not pseudocode-only names.
+
+    **Return value:** JSON with `success`, and per-category arrays `functions`, `globals`, `locals`,
+    `stack_vars`. Each entry includes `ok`, `error` when failed, and may include `address` on success.
+
+    **Minimal example:**
+    ```json
+    {
+      "funcs": [{"old": "sub_401000", "new": "main"}],
+      "globals": [{"old": "dword_403000", "new": "g_config"}]
+    }
+    ```
+
+    **Local variable example:**
+    ```json
+    {
+      "locals": [
+        {"func": "0x401000", "old": "v5", "new": "user_count"}
+      ]
+    }
+    ```
+    """
     try:
         _setup_logging()
         _ensure_paths()
@@ -1266,8 +1356,16 @@ def rename(file_path: str, batch: dict) -> str:
         return json.dumps({"success": False, "error": str(e)}, indent=2)
 
 @mcp.tool()
-def stack_frame(file_path: str, address: str) -> str:
-    """Get stack frame variables."""
+def stack_frame(
+    file_path: Annotated[str, "Target binary file path"],
+    address: Annotated[
+        str,
+        "Function entry address (hex or decimal string). Stack layout is read for the function containing this EA.",
+    ],
+) -> str:
+    """
+    List stack frame members for a function (names, offsets, sizes, types).
+    """
     try:
         _setup_logging()
         _ensure_paths()
@@ -1281,8 +1379,14 @@ def stack_frame(file_path: str, address: str) -> str:
         return json.dumps({"success": False, "error": str(e)}, indent=2)
 
 @mcp.tool()
-def declare_stack(file_path: str, func_addr: str, name: str, offset: int, type_str: str) -> str:
-    """Declare stack variable."""
+def declare_stack(
+    file_path: Annotated[str, "Target binary file path"],
+    func_addr: Annotated[str, "Function entry EA (hex or decimal string)"],
+    name: Annotated[str, "Name for the new stack variable"],
+    offset: Annotated[int, "Stack offset (IDA frame member offset / soff, as used by ida_frame)"],
+    type_str: Annotated[str, "C-style type string, e.g. 'int', 'char *', 'DWORD'"],
+) -> str:
+    """Declare or type a stack frame variable at the given offset for a function."""
     try:
         _setup_logging()
         _ensure_paths()
@@ -1296,8 +1400,12 @@ def declare_stack(file_path: str, func_addr: str, name: str, offset: int, type_s
         return json.dumps({"success": False, "error": str(e)}, indent=2)
 
 @mcp.tool()
-def delete_stack(file_path: str, func_addr: str, name: str) -> str:
-    """Delete stack variable."""
+def delete_stack(
+    file_path: Annotated[str, "Target binary file path"],
+    func_addr: Annotated[str, "Function entry EA (hex or decimal string)"],
+    name: Annotated[str, "Existing stack member name to remove"],
+) -> str:
+    """Remove a stack frame member by name from the given function."""
     try:
         _setup_logging()
         _ensure_paths()
@@ -1311,8 +1419,15 @@ def delete_stack(file_path: str, func_addr: str, name: str) -> str:
         return json.dumps({"success": False, "error": str(e)}, indent=2)
 
 @mcp.tool()
-def declare_type(file_path: str, decls: list[str]) -> str:
-    """Declare C types."""
+def declare_type(
+    file_path: Annotated[str, "Target binary file path"],
+    decls: Annotated[
+        list[str],
+        "C declarations to parse into the local type library, e.g. 'struct foo { int x; }', "
+        "'typedef unsigned long ulong_t'. Each string is passed to parse_decl (PT_SIL).",
+    ],
+) -> str:
+    """Parse C type declarations and validate/import into IDA local types (tinfo)."""
     try:
         _setup_logging()
         _ensure_paths()
@@ -1325,8 +1440,15 @@ def declare_type(file_path: str, decls: list[str]) -> str:
         return json.dumps({"success": False, "error": str(e)}, indent=2)
 
 @mcp.tool()
-def read_struct(file_path: str, queries: list[dict]) -> str:
-    """Read struct instances."""
+def read_struct(
+    file_path: Annotated[str, "Target binary file path"],
+    queries: Annotated[
+        list[dict],
+        "Each dict: addr (hex/dec EA string), type (struct type name as in IDA). "
+        "Reads raw bytes for the struct size at addr; non-struct types return an error in that result.",
+    ],
+) -> str:
+    """Read memory at an address as a struct: returns size and raw hex bytes (field decode is simplified)."""
     try:
         _setup_logging()
         _ensure_paths()
@@ -1339,8 +1461,14 @@ def read_struct(file_path: str, queries: list[dict]) -> str:
         return json.dumps({"success": False, "error": str(e)}, indent=2)
 
 @mcp.tool()
-def search_structs(file_path: str, pattern: str) -> str:
-    """Search struct types."""
+def search_structs(
+    file_path: Annotated[str, "Target binary file path"],
+    pattern: Annotated[
+        str,
+        "Case-insensitive regex matched against struct names in the local types (e.g. '.*NET.*', '^my_').",
+    ],
+) -> str:
+    """List structs whose names match a regex (name, size, member_count)."""
     try:
         _setup_logging()
         _ensure_paths()
@@ -1353,8 +1481,15 @@ def search_structs(file_path: str, pattern: str) -> str:
         return json.dumps({"success": False, "error": str(e)}, indent=2)
 
 @mcp.tool()
-def set_type(file_path: str, items: list[dict]) -> str:
-    """Set types at addresses."""
+def set_type(
+    file_path: Annotated[str, "Target binary file path"],
+    items: Annotated[
+        list[dict],
+        "Each dict: addr (hex/dec EA string), type (C type expression IDA accepts: 'int', 'void *', "
+        "'struct foo', etc.). Applies at runtime via apply_type / SetType / apply_tinfo.",
+    ],
+) -> str:
+    """Apply a C type to a program address (variable, data, or function prototype context per IDA rules)."""
     try:
         _setup_logging()
         _ensure_paths()
@@ -1367,8 +1502,15 @@ def set_type(file_path: str, items: list[dict]) -> str:
         return json.dumps({"success": False, "error": str(e)}, indent=2)
 
 @mcp.tool()
-def infer_types(file_path: str, address: str) -> str:
-    """Run type inference (not implemented)."""
+def infer_types(
+    file_path: Annotated[str, "Reserved for future use; currently ignored"],
+    address: Annotated[str, "Reserved for future use; currently ignored"],
+) -> str:
+    """
+    Placeholder for automated type inference at a function or address.
+
+    Not implemented yet; returns a JSON error. Use decompile_function, set_type, or declare_type instead.
+    """
     return json.dumps({"success": False, "error": "infer_types not yet implemented"}, indent=2)
 
 
