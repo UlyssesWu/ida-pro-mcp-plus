@@ -75,6 +75,72 @@ idc.qexit(0)
 """
 
 
+def script_stop_auto_analysis(shm_path: str, save_idb: bool) -> str:
+    """
+    Generate IDA script to suspend auto-analysis and clear analyzer queues.
+
+    Does not call idaapi.auto_wait(). Optional save via idc.qexit(1).
+    """
+    return f"""
+import json
+import mmap
+import idc
+import ida_auto
+import ida_ida
+
+SHARED_MEM_PATH = r"{shm_path}"
+SAVE_IDB = {save_idb}
+
+ida_auto.enable_auto(False)
+min_ea = ida_ida.inf_get_min_ea()
+max_ea = ida_ida.inf_get_max_ea()
+
+QUEUE_TYPES = (
+    ida_auto.AU_UNK,
+    ida_auto.AU_CODE,
+    ida_auto.AU_WEAK,
+    ida_auto.AU_PROC,
+    ida_auto.AU_TAIL,
+    ida_auto.AU_FCHUNK,
+    ida_auto.AU_USED,
+    ida_auto.AU_USD2,
+    ida_auto.AU_TYPE,
+    ida_auto.AU_LIBF,
+    ida_auto.AU_LBF2,
+    ida_auto.AU_LBF3,
+    ida_auto.AU_CHLB,
+    ida_auto.AU_FINAL,
+)
+errors = []
+for qt in QUEUE_TYPES:
+    try:
+        ida_auto.auto_unmark(min_ea, max_ea, qt)
+    except Exception as e:
+        errors.append({{"queue": repr(qt), "error": str(e)}})
+
+try:
+    ida_auto.auto_cancel(min_ea, max_ea)
+except Exception as e:
+    errors.append({{"op": "auto_cancel", "error": str(e)}})
+
+result = {{
+    "success": True,
+    "auto_is_ok": ida_auto.auto_is_ok(),
+    "is_auto_enabled": ida_auto.is_auto_enabled(),
+    "queue_clear_errors": errors,
+}}
+
+with open(SHARED_MEM_PATH, "r+b") as handle:
+    with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_WRITE) as mm:
+        mm.write(json.dumps(result, ensure_ascii=False).encode("utf-8"))
+
+if SAVE_IDB:
+    idc.qexit(1)
+else:
+    idc.qexit(0)
+"""
+
+
 def script_int_convert(shm_path: str, numbers: list) -> str:
     """
     Generate script to convert numbers to different formats.

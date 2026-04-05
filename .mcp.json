@@ -11,9 +11,10 @@
         "IDAT64_PATH": "",
         "I64_CACHE_DIR": ".i64_cache",
         "IDA_TIMEOUT": "120",
+        "IDA_SKIP_AUTO_WAIT": "0",
         "IDA_SHM_SIZE": "20971520"
       },
-      "description": "Enhanced IDA Pro MCP server with 34 tools for automated reverse engineering"
+      "description": "Enhanced IDA Pro MCP server with 35+ tools for automated reverse engineering"
     }
   },
   "_comments": {
@@ -22,6 +23,7 @@
     "IDAT64_PATH": "Path to idat.exe or idat64.exe (headless version)",
     "I64_CACHE_DIR": "Directory for .i64 database cache (default: .i64_cache)",
     "IDA_TIMEOUT": "Timeout in seconds for IDA script execution (default: 120)",
+    "IDA_SKIP_AUTO_WAIT": "If 1/true/yes, skip idaapi.auto_wait() in IDA scripts (stuck analysis)",
     "IDA_SHM_SIZE": "Shared memory size in bytes (default: 20971520 = 20MB)"
   }
 }

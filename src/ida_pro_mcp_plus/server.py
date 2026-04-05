@@ -67,6 +67,7 @@ from .ida_scripts_analysis import (
 from .ida_scripts_core import (
     script_list_globals,
     script_int_convert,
+    script_stop_auto_analysis,
 )
 # Category 3: Memory Operations
 from .ida_scripts_memory import (
@@ -122,6 +123,31 @@ IDA_TIMEOUT = int(os.getenv("IDA_TIMEOUT", "120"))
 SHM_SIZE = int(os.getenv("IDA_SHM_SIZE", str(20 * 1024 * 1024)))
 
 
+def _env_skip_auto_wait() -> bool:
+    val = os.getenv("IDA_SKIP_AUTO_WAIT", "").strip().lower()
+    return val in ("1", "true", "yes")
+
+
+def _should_skip_auto_wait(wait_for_auto_analysis: Optional[bool]) -> bool:
+    """Whether to replace idaapi.auto_wait() with ida_auto.enable_auto(False)."""
+    if wait_for_auto_analysis is True:
+        return False
+    if wait_for_auto_analysis is False:
+        return True
+    return _env_skip_auto_wait()
+
+
+def _rewrite_script_skip_auto_wait(script_content: str) -> str:
+    if "idaapi.auto_wait()" not in script_content:
+        return script_content
+    modified = script_content.replace(
+        "idaapi.auto_wait()", "ida_auto.enable_auto(False)"
+    )
+    if "import ida_auto" not in modified:
+        modified = "import ida_auto\n" + modified
+    return modified
+
+
 def _setup_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -172,6 +198,7 @@ def _log_configuration() -> None:
     logging.info(f"IDAT64_PATH: {IDAT64_PATH}")
     logging.info(f"I64_CACHE_DIR: {I64_CACHE_DIR}")
     logging.info(f"IDA_TIMEOUT: {IDA_TIMEOUT} seconds")
+    logging.info(f"IDA_SKIP_AUTO_WAIT: {_env_skip_auto_wait()}")
     logging.info(f"IDA_SHM_SIZE: {SHM_SIZE} bytes ({SHM_SIZE // (1024*1024)} MB)")
     logging.info("=" * 60)
 
@@ -278,8 +305,15 @@ def _cleanup_file(path: Optional[str]) -> None:
             logging.warning("Failed to remove file: %s", path)
 
 
-def _run_ida_script(idb_path: str, script_content: str, shm_path: str) -> Dict[str, Any]:
+def _run_ida_script(
+    idb_path: str,
+    script_content: str,
+    shm_path: str,
+    wait_for_auto_analysis: Optional[bool] = None,
+) -> Dict[str, Any]:
     """RUN ida script"""
+    if _should_skip_auto_wait(wait_for_auto_analysis):
+        script_content = _rewrite_script_skip_auto_wait(script_content)
     script_path = None
     try:
         script_path = os.path.join(
@@ -296,17 +330,24 @@ def _run_ida_script(idb_path: str, script_content: str, shm_path: str) -> Dict[s
         ]
         # cmd = [IDAT64_PATH, "-A", "-S", script_path, idb_path]
 
-        subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-            timeout=IDA_TIMEOUT,
-            shell=False,
-            check=True
-        )
-        # import time
-        # time.sleep(0.5)
+        try:
+            subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                timeout=IDA_TIMEOUT,
+                shell=False,
+                check=True
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"IDA subprocess timed out after {IDA_TIMEOUT}s. For binaries where "
+                f"auto-analysis never finishes (e.g. heavy obfuscation), set environment "
+                f"variable IDA_SKIP_AUTO_WAIT=1, call list_strings with "
+                f"wait_for_auto_analysis=False, and/or use stop_auto_analysis to clear "
+                f"analysis queues."
+            ) from exc
 
         return _read_shared_memory(shm_path)
 
@@ -336,9 +377,50 @@ def ping() -> str:
 
 
 @mcp.tool()
+def stop_auto_analysis(
+    file_path: Annotated[str, "Target binary file path (same as other tools)"],
+    save_idb: Annotated[
+        bool,
+        "If true, save the database when exiting IDA (idc.qexit(1)) so cleared queues persist",
+    ] = False,
+) -> str:
+    """
+    Suspend IDA auto-analysis and clear analyzer queues (no auto_wait).
+
+    Use when auto-analysis never finishes (e.g. obfuscated binaries) so subsequent
+    tools can run. Optionally save the .i64 so the cleared state is kept.
+    """
+    try:
+        logging.info(
+            "stop_auto_analysis called: file_path=%s save_idb=%s",
+            file_path,
+            save_idb,
+        )
+        _setup_logging()
+        _ensure_paths()
+        idb_path = ensure_i64(os.path.abspath(file_path))
+        shm_path = _create_shared_memory()
+        script = script_stop_auto_analysis(shm_path, save_idb)
+        data = _run_ida_script(
+            idb_path, script, shm_path, wait_for_auto_analysis=True
+        )
+        logging.info("stop_auto_analysis completed successfully")
+        return json.dumps(data, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error("stop_auto_analysis failed: %s", str(e), exc_info=True)
+        error_result = {"success": False, "error": str(e)}
+        return json.dumps(error_result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
 def list_strings(
     file_path: Annotated[str, "Target binary file path"],
     count: Annotated[int, "Max number of strings, 0 means unlimited"] = 0,
+    wait_for_auto_analysis: Annotated[
+        Optional[bool],
+        "None: use env IDA_SKIP_AUTO_WAIT. True: always wait for auto-analysis. "
+        "False: skip idaapi.auto_wait() (use for stuck/obfuscated analysis).",
+    ] = None,
 ) -> str:
     """
     List strings from the binary.
@@ -346,6 +428,7 @@ def list_strings(
     Args:
         file_path: Target binary file path
         count: Max number of strings, 0 means unlimited
+        wait_for_auto_analysis: Override auto-analysis wait (see annotated type hint)
 
     Returns:
         JSON string with success and strings
@@ -353,8 +436,12 @@ def list_strings(
     try:
         show_message("list_strings",
                      f"Step 1: Called with file={file_path}, count={count}")
-        logging.info("list_strings called: file_path=%s, count=%d",
-                     file_path, count)
+        logging.info(
+            "list_strings called: file_path=%s, count=%d, wait_for_auto_analysis=%s",
+            file_path,
+            count,
+            wait_for_auto_analysis,
+        )
 
         show_message("list_strings", "Step 2: Setup logging and paths")
         _setup_logging()
@@ -371,7 +458,9 @@ def list_strings(
 
         show_message("list_strings",
                      "Step 6: Run IDA script (this may take time)")
-        data = _run_ida_script(idb_path, script, shm_path)
+        data = _run_ida_script(
+            idb_path, script, shm_path, wait_for_auto_analysis=wait_for_auto_analysis
+        )
 
         show_message("list_strings", "Step 7: Completed successfully!")
         logging.info("list_strings completed successfully")
