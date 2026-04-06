@@ -89,7 +89,6 @@ def script_find_bytes(shm_path: str, pattern: str, start_ea: int, end_ea: int) -
     return f"""
 import idaapi
 import ida_bytes
-import ida_search
 import json
 import mmap
 
@@ -97,6 +96,24 @@ SHARED_MEM_PATH = r"{shm_path}"
 PATTERN = "{pattern}"
 START_EA = {start_ea}
 END_EA = {end_ea}
+
+# IDA 9.x: BIN_SEARCH_* lives in ida_bytes (optional BIN_SEARCH_NOSHOW). IDA 7.x: some builds only expose it on ida_search.
+_fwd = getattr(ida_bytes, "BIN_SEARCH_FORWARD", None)
+if _fwd is not None:
+    _SEARCH_FLAGS = _fwd | getattr(ida_bytes, "BIN_SEARCH_NOSHOW", 0)
+else:
+    import ida_search
+    _SEARCH_FLAGS = ida_search.BIN_SEARCH_FORWARD
+
+
+def _bin_search_compat(start_ea, end_ea, image, mask, pat_len, flags):
+    try:
+        return ida_bytes.bin_search(start_ea, end_ea, image, mask, pat_len, flags)
+    except TypeError:
+        if mask is not None:
+            return ida_bytes.bin_search(start_ea, end_ea, image, mask, flags)
+        return ida_bytes.bin_search(start_ea, end_ea, image, None, flags)
+
 
 idaapi.auto_wait()
 
@@ -118,14 +135,11 @@ try:
     
     pattern_bytes = bytes(search_bytes)
     mask = bytes(mask_bytes) if 0 in mask_bytes else None
+    pat_len = len(pattern_bytes)
     
-    # Search for pattern
     ea = START_EA
     while ea < END_EA:
-        if mask:
-            ea = ida_bytes.bin_search(ea, END_EA, pattern_bytes, mask, ida_search.BIN_SEARCH_FORWARD)
-        else:
-            ea = ida_bytes.bin_search(ea, END_EA, pattern_bytes, None, ida_search.BIN_SEARCH_FORWARD)
+        ea = _bin_search_compat(ea, END_EA, pattern_bytes, mask, pat_len, _SEARCH_FLAGS)
         
         if ea == idaapi.BADADDR:
             break
