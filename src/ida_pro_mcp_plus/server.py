@@ -123,6 +123,13 @@ IDA_TIMEOUT = int(os.getenv("IDA_TIMEOUT", "120"))
 IDA_BUILD_TIMEOUT = int(os.getenv("IDA_BUILD_TIMEOUT", "1800"))
 SHM_SIZE = int(os.getenv("IDA_SHM_SIZE", str(20 * 1024 * 1024)))
 
+_UNPACKED_EXTS = (".id0", ".id1", ".id2", ".nam", ".til")
+
+
+def _keep_unpacked() -> bool:
+    val = os.getenv("IDA_KEEP_UNPACKED", "").strip().lower()
+    return val in ("1", "true", "yes")
+
 
 def _env_skip_auto_wait() -> bool:
     val = os.getenv("IDA_SKIP_AUTO_WAIT", "").strip().lower()
@@ -201,7 +208,12 @@ def _log_configuration() -> None:
     logging.info(f"IDA_TIMEOUT: {IDA_TIMEOUT} seconds")
     logging.info(f"IDA_BUILD_TIMEOUT: {IDA_BUILD_TIMEOUT} seconds")
     logging.info(f"IDA_SKIP_AUTO_WAIT: {_env_skip_auto_wait()}")
+    logging.info(f"IDA_KEEP_UNPACKED: {_keep_unpacked()}")
     logging.info(f"IDA_SHM_SIZE: {SHM_SIZE} bytes ({SHM_SIZE // (1024*1024)} MB)")
+    if _keep_unpacked():
+        logging.info("  >> Unpacked mode ON: databases stored as component files")
+        logging.info("  >> (.id0/.id1/.id2/.nam/.til) next to the binary")
+        logging.info("  >> Avoids pack/unpack overhead on every operation")
     logging.info("=" * 60)
 
 
@@ -235,6 +247,152 @@ def _local_db_candidates(file_path: str) -> List[str]:
 
 def _is_ida_database_path(file_path: str) -> bool:
     return os.path.splitext(file_path)[1].lower() in {".i64", ".idb"}
+
+
+def _unpacked_db_exists(binary_path: str) -> bool:
+    """Check if unpacked database component files (.id0, etc.) exist for a binary."""
+    return os.path.exists(f"{binary_path}.id0")
+
+
+def _strip_i64_ext(i64_path: str) -> str:
+    """Strip the .i64/.idb extension to get the database base path.
+
+    e.g. 'foo.dll.i64' -> 'foo.dll'
+    """
+    stem, ext = os.path.splitext(i64_path)
+    if ext.lower() in (".i64", ".idb"):
+        return stem
+    return i64_path
+
+
+def _convert_packed_to_unpacked(i64_path: str) -> None:
+    """Open a packed .i64 database and re-save it in unpacked format (-P-).
+
+    After this call the component files (.id0, .id1, …) sit next to *i64_path*.
+    The caller is responsible for deleting the stale .i64 and/or moving the
+    component files to the desired location.
+    """
+    logging.info("Converting packed database to unpacked: %s", i64_path)
+    script_path = None
+    try:
+        script_path = os.path.join(
+            tempfile.gettempdir(),
+            f"ida_convert_unpack_{uuid.uuid4().hex}.py",
+        )
+        with open(script_path, "w", encoding="utf-8") as handle:
+            handle.write("import idc\nidc.qexit(1)\n")
+
+        cmd = [
+            IDAT64_PATH,
+            "-A",
+            "-P-",
+            f'-S"{script_path}"',
+            i64_path,
+        ]
+        logging.info("Running IDAT (convert to unpacked): %s", " ".join(cmd))
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                timeout=IDA_BUILD_TIMEOUT,
+                shell=False,
+                text=True,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"IDA database conversion timed out after {IDA_BUILD_TIMEOUT}s."
+            ) from exc
+
+        if result.returncode not in (0, 1):
+            details = _format_process_error_output(result.stdout, result.stderr)
+            raise RuntimeError(
+                f"IDA conversion failed with exit code {result.returncode}{details}"
+            )
+    finally:
+        _cleanup_file(script_path)
+
+
+def _move_unpacked_files(src_base: str, dst_base: str) -> None:
+    """Move unpacked database component files from *src_base* to *dst_base*.
+
+    src_base: e.g. 'cache_dir/myfile.dll'  (expects cache_dir/myfile.dll.id0 …)
+    dst_base: e.g. 'bin_dir/myfile.dll'    (creates bin_dir/myfile.dll.id0 …)
+    """
+    for ext in _UNPACKED_EXTS:
+        src = f"{src_base}{ext}"
+        if os.path.exists(src):
+            dst = f"{dst_base}{ext}"
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.move(src, dst)
+
+
+def _cleanup_unpacked_files(base_path: str) -> None:
+    """Remove unpacked database component files for a base path."""
+    for ext in _UNPACKED_EXTS:
+        _cleanup_file(f"{base_path}{ext}")
+
+
+def _generate_unpacked_db(file_path: str) -> str:
+    """Generate an unpacked database directly (no .i64 container)."""
+    logging.info("Generating unpacked database for: %s", file_path)
+    script_path = None
+    try:
+        script_path = os.path.join(
+            tempfile.gettempdir(),
+            f"ida_build_unpacked_{uuid.uuid4().hex}.py",
+        )
+        with open(script_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                "import idaapi\nimport idc\n"
+                "idaapi.auto_wait()\nidc.qexit(1)\n"
+            )
+
+        cmd = [
+            IDAT64_PATH,
+            "-A",
+            "-P-",
+            f'-S"{script_path}"',
+            file_path,
+        ]
+        logging.info("Running IDAT (generate unpacked): %s", " ".join(cmd))
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                timeout=IDA_BUILD_TIMEOUT,
+                shell=False,
+                text=True,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"IDA unpacked DB generation timed out after {IDA_BUILD_TIMEOUT}s. "
+                f"Increase IDA_BUILD_TIMEOUT for large binaries."
+            ) from exc
+
+        if result.returncode not in (0, 1):
+            details = _format_process_error_output(result.stdout, result.stderr)
+            raise RuntimeError(
+                f"IDA analysis failed with exit code {result.returncode}{details}"
+            )
+    finally:
+        _cleanup_file(script_path)
+
+    if not _unpacked_db_exists(file_path):
+        raise FileNotFoundError(
+            f"Unpacked database not generated. Expected: {file_path}.id0"
+        )
+
+    # Clean up any .i64 that IDA might have created alongside
+    for candidate in _local_db_candidates(file_path):
+        if os.path.exists(candidate):
+            _cleanup_file(candidate)
+
+    logging.info("Unpacked database generated for: %s", file_path)
+    return file_path
 
 
 def _generate_i64(file_path: str, cache_path: str) -> str:
@@ -308,6 +466,52 @@ def ensure_i64(file_path: str) -> str:
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"Target file not found: {file_path}")
 
+    # --- Unpacked database mode ------------------------------------------
+    if _keep_unpacked():
+        # When user passes a .i64/.idb directly, use it with -P- (partial
+        # optimisation: avoids re-packing on exit but still needs one unpack).
+        if _is_ida_database_path(file_path):
+            show_message("ensure_i64", f"Unpacked mode: .i64 passed directly, using as-is: {file_path}")
+            return file_path
+
+        # Fast path: unpacked component files already next to the binary
+        if _unpacked_db_exists(file_path):
+            show_message("ensure_i64", f"Unpacked DB found: {file_path}")
+            logging.info("Found existing unpacked database for: %s", file_path)
+            return file_path
+
+        # Check for local packed databases that can be converted
+        for local_db in _local_db_candidates(file_path):
+            if os.path.exists(local_db):
+                show_message("ensure_i64", f"Converting local .i64 to unpacked: {local_db}")
+                try:
+                    _convert_packed_to_unpacked(local_db)
+                    if _unpacked_db_exists(file_path):
+                        _cleanup_file(local_db)
+                        return file_path
+                except Exception:
+                    logging.warning("Failed to convert %s, falling back", local_db, exc_info=True)
+                break
+
+        # Check cache directory for packed database to convert
+        cache_path = _cache_i64_path(file_path)
+        if os.path.exists(cache_path):
+            show_message("ensure_i64", f"Converting cached .i64 to unpacked: {cache_path}")
+            try:
+                _convert_packed_to_unpacked(cache_path)
+                cache_base = _strip_i64_ext(cache_path)
+                _move_unpacked_files(cache_base, file_path)
+                _cleanup_file(cache_path)
+                if _unpacked_db_exists(file_path):
+                    return file_path
+            except Exception:
+                logging.warning("Failed to convert cached %s, falling back", cache_path, exc_info=True)
+
+        # Generate a fresh unpacked database
+        show_message("ensure_i64", "Generating new unpacked database (first time, will take a while)...")
+        return _generate_unpacked_db(file_path)
+
+    # --- Standard packed database mode -----------------------------------
     if _is_ida_database_path(file_path):
         show_message("ensure_i64", f"Input is IDA DB, use directly: {file_path}")
         return file_path
@@ -375,6 +579,13 @@ def _run_ida_script(
     """RUN ida script"""
     if _should_skip_auto_wait(wait_for_auto_analysis):
         script_content = _rewrite_script_skip_auto_wait(script_content)
+
+    unpacked = _keep_unpacked()
+    if unpacked:
+        # Persist analysis results so subsequent opens skip auto-analysis.
+        # qexit(1) saves; with -P- the save is cheap (no packing).
+        script_content = script_content.replace("idc.qexit(0)", "idc.qexit(1)")
+
     script_path = None
     try:
         script_path = os.path.join(
@@ -386,10 +597,10 @@ def _run_ida_script(
         cmd = [
             IDAT64_PATH,
             "-A",
-            f'-S"{script_path}"',
-            idb_path
         ]
-        # cmd = [IDAT64_PATH, "-A", "-S", script_path, idb_path]
+        if unpacked:
+            cmd.append("-P-")
+        cmd.extend([f'-S"{script_path}"', idb_path])
 
         try:
             result = subprocess.run(
@@ -1636,7 +1847,8 @@ def install_mcp_servers(ida_path: str, idat_path: str) -> int:
             "I64_CACHE_DIR": ".i64_cache",
             "IDA_TIMEOUT": "120",
             "IDA_BUILD_TIMEOUT": "1800",
-            "IDA_SHM_SIZE": "20971520"
+            "IDA_SHM_SIZE": "20971520",
+            "IDA_KEEP_UNPACKED": "0"
         },
         "timeout": 1800,
         "disabled": False,
@@ -1759,7 +1971,8 @@ Documentation: https://github.com/GameSecurityFrontierLib/ida-pro-mcp-plus
                         "IDAT64_PATH": "<PATH_TO_IDAT>",
                         "I64_CACHE_DIR": ".i64_cache",
                         "IDA_TIMEOUT": "120",
-                        "IDA_BUILD_TIMEOUT": "1800"
+                        "IDA_BUILD_TIMEOUT": "1800",
+                        "IDA_KEEP_UNPACKED": "0"
                     },
                     "timeout": 1800,
                     "disabled": False

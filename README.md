@@ -275,7 +275,20 @@ AI: [Uses multiple tools in parallel]
 | `IDA_TIMEOUT` | `120` | Timeout in seconds for each **tool** run (`idat.exe` executing a one-off script) |
 | `IDA_BUILD_TIMEOUT` | `1800` | Timeout in seconds for **first-time** creation of a cached `.i64` from a binary (large modules like `GameAssembly.dll` often need a higher value) |
 | `IDA_SKIP_AUTO_WAIT` | *(unset)* | If `1`, `true`, or `yes`, tools skip `idaapi.auto_wait()` by default (individual tools can still override). Use when auto-analysis never finishes (heavy obfuscation) |
+| `IDA_KEEP_UNPACKED` | *(unset)* | If `1`, `true`, or `yes`, keeps databases in unpacked format (.id0/.id1/.id2/.nam/.til) **avoiding the pack/unpack overhead on every operation**. Significantly faster for large binaries. See section below |
 | `IDA_SHM_SIZE` | `20971520` | Shared memory size (20MB) |
+
+### Unpacked Database Mode (large-file acceleration)
+
+By default IDA packs the database into a single `.i64` file. Every MCP operation requires idat to **unpack** it on open and **repack** it on close — for large databases this can take tens of seconds.
+
+With `IDA_KEEP_UNPACKED=1`, the database is stored as individual component files next to the binary. IDA reads/writes them directly, **skipping the pack/unpack step entirely**. Analysis results are also persisted between operations, so auto-analysis only runs once.
+
+```json
+{ "env": { "IDA_KEEP_UNPACKED": "1" } }
+```
+
+> **Note**: Component files are stored beside the binary (the cache directory is not used). Existing cached `.i64` files are automatically converted on first access.
 
 ### `file_path`: binary vs existing database
 

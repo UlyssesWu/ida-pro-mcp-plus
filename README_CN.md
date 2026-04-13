@@ -287,7 +287,48 @@ AI：[并行使用多个工具]
 | `IDA_TIMEOUT` | `120` | 单次 **工具调用** 在 `idat.exe` 中执行脚本的超时（秒） |
 | `IDA_BUILD_TIMEOUT` | `1800` | **首次**从二进制生成缓存 `.i64` 时的超时（秒）；大文件（如 `GameAssembly.dll`）可适当调大 |
 | `IDA_SKIP_AUTO_WAIT` | *未设置* | 设为 `1`、`true` 或 `yes` 时，默认跳过 `idaapi.auto_wait()`（各工具仍可单独覆盖）。用于自动分析卡死、永不结束的场景 |
+| `IDA_KEEP_UNPACKED` | *未设置* | 设为 `1`、`true` 或 `yes` 时，数据库保持解包格式（.id0/.id1/.id2/.nam/.til），**避免每次操作的 pack/unpack 开销**。对大型二进制文件可显著加速。详见下方说明 |
 | `IDA_SHM_SIZE` | `20971520` | 共享内存大小（20MB） |
+
+### 🚀 解包数据库模式（大文件加速）
+
+IDA 默认将数据库打包为单个 `.i64` 文件。每次通过 MCP 执行操作时，idat 需要：
+1. **解包** `.i64` → 提取 `.id0`、`.id1`、`.id2`、`.nam`、`.til` 组件文件
+2. 执行脚本
+3. **打包** 组件文件 → 重新生成 `.i64`
+
+对于大型二进制文件（如 `GameAssembly.dll`），这个 pack/unpack 过程可能耗时数十秒。
+
+**启用解包模式** 后（`IDA_KEEP_UNPACKED=1`），数据库以组件文件形式直接存储在二进制文件旁边：
+
+```
+myfile.dll          ← 原始二进制
+myfile.dll.id0      ← B-tree 数据库（分析数据）
+myfile.dll.id1      ← 字节标志
+myfile.dll.id2      ← 稀疏内存数据
+myfile.dll.nam      ← 名称索引
+myfile.dll.til      ← 类型信息库
+```
+
+**效果**：
+- 首次操作：与原始模式相同（需完成初始分析）
+- **后续操作**：IDA 直接读写组件文件，**跳过 pack/unpack 步骤**
+- 分析结果自动持久化（auto_wait 只需首次执行）
+
+**配置方法**：
+
+```json
+{
+  "env": {
+    "IDA_KEEP_UNPACKED": "1"
+  }
+}
+```
+
+**注意事项**：
+- 启用后，组件文件存储在二进制文件所在目录（不使用缓存目录）
+- 如已有缓存的 `.i64`，会自动转换为解包格式
+- 如需恢复打包模式，删除组件文件并将 `IDA_KEEP_UNPACKED` 设为 `0`
 
 ### `file_path`：二进制还是已有数据库
 
