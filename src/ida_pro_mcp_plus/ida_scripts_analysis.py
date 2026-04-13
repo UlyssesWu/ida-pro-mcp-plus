@@ -262,11 +262,19 @@ idaapi.auto_wait()
 result = {{"success": True, "exports": []}}
 
 try:
-    for index, (ea, name, ordinal) in enumerate(idautils.Entries()):
-        if MAX_COUNT and index >= MAX_COUNT:
+    for entry in idautils.Entries():
+        # IDA may return either 3-tuple or 4-tuple depending on version.
+        if len(entry) == 4:
+            _, ordinal, ea, name = entry
+        elif len(entry) == 3:
+            ea, name, ordinal = entry
+        else:
+            continue
+
+        if MAX_COUNT and len(result["exports"]) >= MAX_COUNT:
             result["has_more"] = True
             break
-        
+
         result["exports"].append({{
             "name": name,
             "address": hex(ea),

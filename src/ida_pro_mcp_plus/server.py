@@ -28,7 +28,6 @@ import os
 import shutil
 import subprocess
 import tempfile
-import time
 import uuid
 from typing import Annotated, Any, Dict, List, Optional
 
@@ -259,10 +258,6 @@ def _log_configuration() -> None:
     logging.info(f"IDA_SKIP_AUTO_WAIT: {_env_skip_auto_wait()}")
     logging.info(f"IDA_KEEP_UNPACKED: {_keep_unpacked()}")
     logging.info(f"IDA_LOG_LEVEL: {LOG_LEVEL}")
-    logging.info(
-        "IDA_MAX_TRANSPORT_RESTARTS: %s",
-        os.getenv("IDA_MAX_TRANSPORT_RESTARTS", "20"),
-    )
     logging.info(f"IDA_SHM_SIZE: {SHM_SIZE} bytes ({SHM_SIZE // (1024*1024)} MB)")
     if _keep_unpacked():
         logging.info("  >> Unpacked mode ON: databases stored as component files")
@@ -2042,33 +2037,19 @@ Documentation: https://github.com/GameSecurityFrontierLib/ida-pro-mcp-plus
     _log_configuration()
     _ensure_paths()
     logging.info("Path validation successful - Server ready to accept requests")
-    transport_restarts = 0
-    max_transport_restarts = int(os.getenv("IDA_MAX_TRANSPORT_RESTARTS", "20"))
 
-    while True:
-        try:
-            mcp.run()
-            return
-        except Exception as exc:
-            # FastMCP can surface transport-level exceptions (often wrapped in
-            # ExceptionGroup) when the client cancels/reloads.
-            if not _is_transport_closed_error(exc):
-                raise
-
-            transport_restarts += 1
-            if transport_restarts > max_transport_restarts:
-                logging.error(
-                    "MCP transport closed too many times (%d), exiting server process.",
-                    transport_restarts,
-                )
-                return
-
-            logging.warning(
-                "MCP transport interruption detected; restarting stdio loop (%d/%d).",
-                transport_restarts,
-                max_transport_restarts,
-            )
-            time.sleep(0.2)
+    try:
+        mcp.run()
+    except Exception as exc:
+        if _is_transport_closed_error(exc):
+            # The client (Cursor) closed the stdio pipe.  Worker threads may
+            # still be blocking inside subprocess.run() waiting for IDA to
+            # finish.  A normal return / sys.exit would wait for those threads,
+            # keeping the process alive as a zombie that Cursor cannot restart.
+            # os._exit() terminates immediately so Cursor can respawn us.
+            logging.warning("MCP client disconnected – force-exiting so Cursor can restart the server.")
+            os._exit(0)
+        raise
 
 if __name__ == "__main__":
     main()
