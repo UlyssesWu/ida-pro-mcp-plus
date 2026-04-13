@@ -28,6 +28,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 from typing import Annotated, Any, Dict, List, Optional
 
@@ -122,6 +123,7 @@ I64_CACHE_DIR = os.getenv("I64_CACHE_DIR", ".i64_cache")
 IDA_TIMEOUT = int(os.getenv("IDA_TIMEOUT", "120"))
 IDA_BUILD_TIMEOUT = int(os.getenv("IDA_BUILD_TIMEOUT", "1800"))
 SHM_SIZE = int(os.getenv("IDA_SHM_SIZE", str(20 * 1024 * 1024)))
+LOG_LEVEL = os.getenv("IDA_LOG_LEVEL", "WARNING").strip().upper()
 
 _UNPACKED_EXTS = (".id0", ".id1", ".id2", ".nam", ".til")
 
@@ -157,10 +159,57 @@ def _rewrite_script_skip_auto_wait(script_content: str) -> str:
 
 
 def _setup_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="[%(asctime)s] %(levelname)s %(message)s",
+    level = getattr(logging, LOG_LEVEL, logging.WARNING)
+    root = logging.getLogger()
+
+    if root.handlers:
+        root.setLevel(level)
+        for handler in root.handlers:
+            handler.setLevel(level)
+    else:
+        logging.basicConfig(
+            level=level,
+            format="[%(asctime)s] %(levelname)s %(message)s",
+        )
+
+    # Cursor treats stderr as "error" lines in the UI; keep MCP framework
+    # internals at WARNING+ to avoid noisy pseudo-errors.
+    for noisy_logger in (
+        "mcp.server",
+        "mcp.server.fastmcp",
+        "mcp.server.lowlevel",
+        "mcp.shared.session",
+    ):
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+
+
+def _flatten_exceptions(exc: BaseException) -> List[BaseException]:
+    """Flatten nested exception groups (Python 3.11+) into a plain list."""
+    items: List[BaseException] = [exc]
+    nested = getattr(exc, "exceptions", None)
+    if nested:
+        for sub_exc in nested:
+            if isinstance(sub_exc, BaseException):
+                items.extend(_flatten_exceptions(sub_exc))
+    return items
+
+
+def _is_transport_closed_error(exc: BaseException) -> bool:
+    """Detect stdio transport-closed errors caused by client disconnect."""
+    flat = _flatten_exceptions(exc)
+    if any(type(e).__name__ == "BrokenResourceError" for e in flat):
+        return True
+
+    text = "\n".join(f"{type(e).__name__}: {e}" for e in flat)
+    transport_markers = (
+        "ClosedResourceError",
+        "BrokenPipeError",
+        "EndOfStream",
+        "ConnectionResetError",
+        "Connection closed",
+        "transport_closed",
     )
+    return any(marker in text for marker in transport_markers)
 
 
 def _ensure_paths() -> None:
@@ -209,6 +258,11 @@ def _log_configuration() -> None:
     logging.info(f"IDA_BUILD_TIMEOUT: {IDA_BUILD_TIMEOUT} seconds")
     logging.info(f"IDA_SKIP_AUTO_WAIT: {_env_skip_auto_wait()}")
     logging.info(f"IDA_KEEP_UNPACKED: {_keep_unpacked()}")
+    logging.info(f"IDA_LOG_LEVEL: {LOG_LEVEL}")
+    logging.info(
+        "IDA_MAX_TRANSPORT_RESTARTS: %s",
+        os.getenv("IDA_MAX_TRANSPORT_RESTARTS", "20"),
+    )
     logging.info(f"IDA_SHM_SIZE: {SHM_SIZE} bytes ({SHM_SIZE // (1024*1024)} MB)")
     if _keep_unpacked():
         logging.info("  >> Unpacked mode ON: databases stored as component files")
@@ -1988,7 +2042,33 @@ Documentation: https://github.com/GameSecurityFrontierLib/ida-pro-mcp-plus
     _log_configuration()
     _ensure_paths()
     logging.info("Path validation successful - Server ready to accept requests")
-    mcp.run()
+    transport_restarts = 0
+    max_transport_restarts = int(os.getenv("IDA_MAX_TRANSPORT_RESTARTS", "20"))
+
+    while True:
+        try:
+            mcp.run()
+            return
+        except Exception as exc:
+            # FastMCP can surface transport-level exceptions (often wrapped in
+            # ExceptionGroup) when the client cancels/reloads.
+            if not _is_transport_closed_error(exc):
+                raise
+
+            transport_restarts += 1
+            if transport_restarts > max_transport_restarts:
+                logging.error(
+                    "MCP transport closed too many times (%d), exiting server process.",
+                    transport_restarts,
+                )
+                return
+
+            logging.warning(
+                "MCP transport interruption detected; restarting stdio loop (%d/%d).",
+                transport_restarts,
+                max_transport_restarts,
+            )
+            time.sleep(0.2)
 
 if __name__ == "__main__":
     main()
