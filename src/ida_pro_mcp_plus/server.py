@@ -120,6 +120,7 @@ IDAT64_PATH = os.getenv(
     "IDAT64_PATH", r"F:\\tools\\analyze\\ida7.x\\idat64.exe")
 I64_CACHE_DIR = os.getenv("I64_CACHE_DIR", ".i64_cache")
 IDA_TIMEOUT = int(os.getenv("IDA_TIMEOUT", "120"))
+IDA_BUILD_TIMEOUT = int(os.getenv("IDA_BUILD_TIMEOUT", "1800"))
 SHM_SIZE = int(os.getenv("IDA_SHM_SIZE", str(20 * 1024 * 1024)))
 
 
@@ -198,6 +199,7 @@ def _log_configuration() -> None:
     logging.info(f"IDAT64_PATH: {IDAT64_PATH}")
     logging.info(f"I64_CACHE_DIR: {I64_CACHE_DIR}")
     logging.info(f"IDA_TIMEOUT: {IDA_TIMEOUT} seconds")
+    logging.info(f"IDA_BUILD_TIMEOUT: {IDA_BUILD_TIMEOUT} seconds")
     logging.info(f"IDA_SKIP_AUTO_WAIT: {_env_skip_auto_wait()}")
     logging.info(f"IDA_SHM_SIZE: {SHM_SIZE} bytes ({SHM_SIZE // (1024*1024)} MB)")
     logging.info("=" * 60)
@@ -219,6 +221,22 @@ def _local_i64_path(file_path: str) -> str:
     return f"{file_path}.i64"
 
 
+def _local_db_candidates(file_path: str) -> List[str]:
+    stem, _ = os.path.splitext(file_path)
+    candidates = [
+        f"{file_path}.i64",
+        f"{stem}.i64",
+        f"{file_path}.idb",
+        f"{stem}.idb",
+    ]
+    # Keep order stable while removing duplicates.
+    return list(dict.fromkeys(candidates))
+
+
+def _is_ida_database_path(file_path: str) -> bool:
+    return os.path.splitext(file_path)[1].lower() in {".i64", ".idb"}
+
+
 def _generate_i64(file_path: str, cache_path: str) -> str:
     """Generate i64 file using IDA in batch mode"""
     logging.info("Generating i64: %s", file_path)
@@ -226,28 +244,55 @@ def _generate_i64(file_path: str, cache_path: str) -> str:
     cache_dir = os.path.dirname(cache_path)
     os.makedirs(cache_dir, exist_ok=True)
 
-    cmd = [
-        IDA64_PATH,
-        "-A",
-        "-B",
-        f"-o{cache_path}",
-        file_path
-    ]
+    # Use an explicit script + qexit(1) to save DB and exit, which avoids
+    # generating massive .asm outputs from -B for large binaries.
+    script_path = None
+    try:
+        script_path = os.path.join(
+            tempfile.gettempdir(),
+            f"ida_build_i64_{uuid.uuid4().hex}.py"
+        )
+        with open(script_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                "import idaapi\n"
+                "import idc\n"
+                "idaapi.auto_wait()\n"
+                "idc.qexit(1)\n"
+            )
 
-    logging.info("Running IDA: %s", " ".join(cmd))
+        cmd = [
+            IDAT64_PATH,
+            "-A",
+            f'-S"{script_path}"',
+            f"-o{cache_path}",
+            file_path,
+        ]
+        logging.info("Running IDAT: %s", " ".join(cmd))
 
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL,
-        timeout=600,
-        shell=False
-    )
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                timeout=IDA_BUILD_TIMEOUT,
+                shell=False,
+                text=True,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"IDA i64 generation timed out after {IDA_BUILD_TIMEOUT}s. "
+                f"Increase IDA_BUILD_TIMEOUT for large binaries."
+            ) from exc
 
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"IDA analysis failed with exit code {result.returncode}")
+        # idc.qexit(1) indicates successful save-and-exit. Accept both 0/1.
+        if result.returncode not in (0, 1):
+            details = _format_process_error_output(result.stdout, result.stderr)
+            raise RuntimeError(
+                f"IDA analysis failed with exit code {result.returncode}{details}"
+            )
+    finally:
+        _cleanup_file(script_path)
 
     if not os.path.exists(cache_path):
         raise FileNotFoundError(f"i64 not generated at: {cache_path}")
@@ -257,16 +302,21 @@ def _generate_i64(file_path: str, cache_path: str) -> str:
 
 
 def ensure_i64(file_path: str) -> str:
+    file_path = os.path.abspath(file_path)
     show_message("ensure_i64", f"Input: {file_path}")
 
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"Target file not found: {file_path}")
 
-    local_i64 = _local_i64_path(file_path)
-    show_message(
-        "ensure_i64", f"Check local i64: {local_i64}\nExists: {os.path.exists(local_i64)}")
-    if os.path.exists(local_i64):
-        return local_i64
+    if _is_ida_database_path(file_path):
+        show_message("ensure_i64", f"Input is IDA DB, use directly: {file_path}")
+        return file_path
+
+    for local_db in _local_db_candidates(file_path):
+        exists = os.path.exists(local_db)
+        show_message("ensure_i64", f"Check local DB: {local_db}\nExists: {exists}")
+        if exists:
+            return local_db
 
     cache_path = _cache_i64_path(file_path)
     show_message(
@@ -305,6 +355,17 @@ def _cleanup_file(path: Optional[str]) -> None:
             logging.warning("Failed to remove file: %s", path)
 
 
+def _format_process_error_output(stdout: str, stderr: str, lines: int = 20) -> str:
+    parts: List[str] = []
+    if stderr and stderr.strip():
+        parts.append("stderr:\n" + "\n".join(stderr.strip().splitlines()[-lines:]))
+    if stdout and stdout.strip():
+        parts.append("stdout:\n" + "\n".join(stdout.strip().splitlines()[-lines:]))
+    if not parts:
+        return ""
+    return "\n" + "\n\n".join(parts)
+
+
 def _run_ida_script(
     idb_path: str,
     script_content: str,
@@ -331,14 +392,15 @@ def _run_ida_script(
         # cmd = [IDAT64_PATH, "-A", "-S", script_path, idb_path]
 
         try:
-            subprocess.run(
+            result = subprocess.run(
                 cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 stdin=subprocess.DEVNULL,
                 timeout=IDA_TIMEOUT,
                 shell=False,
-                check=True
+                check=False,
+                text=True,
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(
@@ -348,6 +410,11 @@ def _run_ida_script(
                 f"wait_for_auto_analysis=False, and/or use stop_auto_analysis to clear "
                 f"analysis queues."
             ) from exc
+        if result.returncode not in (0, 1):
+            details = _format_process_error_output(result.stdout, result.stderr)
+            raise RuntimeError(
+                f"IDA script failed with exit code {result.returncode}{details}"
+            )
 
         return _read_shared_memory(shm_path)
 
@@ -1568,6 +1635,7 @@ def install_mcp_servers(ida_path: str, idat_path: str) -> int:
             "IDAT64_PATH": str(idat_path).replace("\\", "/"),
             "I64_CACHE_DIR": ".i64_cache",
             "IDA_TIMEOUT": "120",
+            "IDA_BUILD_TIMEOUT": "1800",
             "IDA_SHM_SIZE": "20971520"
         },
         "timeout": 1800,
@@ -1690,7 +1758,8 @@ Documentation: https://github.com/GameSecurityFrontierLib/ida-pro-mcp-plus
                         "IDA64_PATH": "<PATH_TO_IDA>",
                         "IDAT64_PATH": "<PATH_TO_IDAT>",
                         "I64_CACHE_DIR": ".i64_cache",
-                        "IDA_TIMEOUT": "120"
+                        "IDA_TIMEOUT": "120",
+                        "IDA_BUILD_TIMEOUT": "1800"
                     },
                     "timeout": 1800,
                     "disabled": False

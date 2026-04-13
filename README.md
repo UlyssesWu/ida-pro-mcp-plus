@@ -271,9 +271,18 @@ AI: [Uses multiple tools in parallel]
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `I64_CACHE_DIR` | `.i64_cache` | Database cache directory |
-| `IDA_TIMEOUT` | `120` | Timeout in seconds |
+| `I64_CACHE_DIR` | `.i64_cache` | Database cache directory (relative paths are resolved next to the input binary) |
+| `IDA_TIMEOUT` | `120` | Timeout in seconds for each **tool** run (`idat.exe` executing a one-off script) |
+| `IDA_BUILD_TIMEOUT` | `1800` | Timeout in seconds for **first-time** creation of a cached `.i64` from a binary (large modules like `GameAssembly.dll` often need a higher value) |
+| `IDA_SKIP_AUTO_WAIT` | *(unset)* | If `1`, `true`, or `yes`, tools skip `idaapi.auto_wait()` by default (individual tools can still override). Use when auto-analysis never finishes (heavy obfuscation) |
 | `IDA_SHM_SIZE` | `20971520` | Shared memory size (20MB) |
+
+### `file_path`: binary vs existing database
+
+Every tool’s `file_path` argument can be either:
+
+1. **An existing IDA database** — pass a `.i64` or `.idb` file. It is opened directly; nothing is rebuilt from the PE.
+2. **A binary** — pass the executable or library path. The server checks, in order: `<path>.i64`, `<basename-without-ext>.i64`, same pair for `.idb` next to the file; if none exist, it generates `<I64_CACHE_DIR>/<basename>.i64` under the binary’s directory (or under `I64_CACHE_DIR` when it is absolute).
 
 ### Manual Configuration
 
