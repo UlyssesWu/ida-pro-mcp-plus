@@ -21,6 +21,8 @@ Repository: https://github.com/oxygen1a1/ida-pro-mcp-plus
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import json
 import logging
 import mmap
@@ -28,6 +30,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import uuid
 from typing import Annotated, Any, Dict, List, Optional
 
@@ -46,6 +49,7 @@ from .ida_scripts import (
     script_list_strings,
     script_disassemble_function,
     script_decompile_function,
+    script_batch_decompile_functions,
     script_list_functions,
     script_get_function_info,
     script_list_imports,
@@ -123,8 +127,16 @@ IDA_TIMEOUT = int(os.getenv("IDA_TIMEOUT", "120"))
 IDA_BUILD_TIMEOUT = int(os.getenv("IDA_BUILD_TIMEOUT", "1800"))
 SHM_SIZE = int(os.getenv("IDA_SHM_SIZE", str(20 * 1024 * 1024)))
 LOG_LEVEL = os.getenv("IDA_LOG_LEVEL", "WARNING").strip().upper()
+IDA_ISOLATE_USER_DIR = os.getenv("IDA_ISOLATE_USER_DIR", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+IDA_USER_DIR = os.getenv("IDA_USER_DIR", "").strip()
 
 _UNPACKED_EXTS = (".id0", ".id1", ".id2", ".nam", ".til")
+_DB_LOCKS_GUARD = threading.Lock()
+_DB_LOCKS: Dict[str, threading.RLock] = {}
 
 
 def _keep_unpacked() -> bool:
@@ -135,6 +147,41 @@ def _keep_unpacked() -> bool:
 def _env_skip_auto_wait() -> bool:
     val = os.getenv("IDA_SKIP_AUTO_WAIT", "").strip().lower()
     return val in ("1", "true", "yes")
+
+
+def _resolved_ida_user_dir() -> Optional[str]:
+    """Return isolated IDAUSR path used for headless subprocesses."""
+    if not IDA_ISOLATE_USER_DIR:
+        return None
+    user_dir = IDA_USER_DIR or os.path.join(tempfile.gettempdir(), "ida_mcp_user")
+    os.makedirs(user_dir, exist_ok=True)
+    return user_dir
+
+
+def _build_ida_subprocess_env() -> Dict[str, str]:
+    """Build environment for IDA subprocesses."""
+    env = os.environ.copy()
+    user_dir = _resolved_ida_user_dir()
+    if user_dir:
+        env["IDAUSR"] = user_dir
+    return env
+
+
+def _db_lock_key(path: str) -> str:
+    normalized = os.path.abspath(path)
+    if _is_ida_database_path(normalized):
+        normalized = _strip_i64_ext(normalized)
+    return os.path.normcase(normalized)
+
+
+def _get_db_lock(path: str) -> threading.RLock:
+    key = _db_lock_key(path)
+    with _DB_LOCKS_GUARD:
+        lock = _DB_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _DB_LOCKS[key] = lock
+    return lock
 
 
 def _should_skip_auto_wait(wait_for_auto_analysis: Optional[bool]) -> bool:
@@ -211,6 +258,46 @@ def _is_transport_closed_error(exc: BaseException) -> bool:
     return any(marker in text for marker in transport_markers)
 
 
+def _patch_mcp_request_responder_race() -> None:
+    """Work around mcp v1.27 cancellation race (python-sdk#2416).
+
+    In mcp 1.27.0, RequestResponder.respond() asserts when a cancel
+    notification wins a race and marks the request completed just before
+    respond() is called. We patch respond() to silently drop the late
+    response in that case, matching upstream proposed fixes.
+    """
+    try:
+        mcp_session = __import__("mcp.shared.session", fromlist=["session"])
+    except Exception:
+        return
+
+    responder_cls = getattr(mcp_session, "RequestResponder", None)
+    if responder_cls is None:
+        return
+    if getattr(responder_cls, "_ida_plus_race_patch", False):
+        return
+
+    original_respond = getattr(responder_cls, "respond", None)
+    code_obj = getattr(original_respond, "__code__", None)
+    if code_obj is None or "Request already responded to" not in code_obj.co_consts:
+        return
+
+    async def _patched_respond(self, response):
+        if not self._entered:  # pragma: no cover
+            raise RuntimeError("RequestResponder must be used as a context manager")
+        if self._completed:
+            return
+        if not self.cancelled:  # pragma: no branch
+            self._completed = True
+            await self._session._send_response(  # type: ignore[reportPrivateUsage]
+                request_id=self.request_id, response=response
+            )
+
+    responder_cls.respond = _patched_respond
+    responder_cls._ida_plus_race_patch = True
+    logging.info("Applied local workaround for mcp cancellation race in RequestResponder.respond().")
+
+
 def _ensure_paths() -> None:
     """Validate IDA executable paths and provide clear error messages."""
     if not os.path.exists(IDA64_PATH):
@@ -257,6 +344,9 @@ def _log_configuration() -> None:
     logging.info(f"IDA_BUILD_TIMEOUT: {IDA_BUILD_TIMEOUT} seconds")
     logging.info(f"IDA_SKIP_AUTO_WAIT: {_env_skip_auto_wait()}")
     logging.info(f"IDA_KEEP_UNPACKED: {_keep_unpacked()}")
+    logging.info(f"IDA_ISOLATE_USER_DIR: {IDA_ISOLATE_USER_DIR}")
+    if IDA_ISOLATE_USER_DIR:
+        logging.info(f"IDA_USER_DIR: {_resolved_ida_user_dir()}")
     logging.info(f"IDA_LOG_LEVEL: {LOG_LEVEL}")
     logging.info(f"IDA_SHM_SIZE: {SHM_SIZE} bytes ({SHM_SIZE // (1024*1024)} MB)")
     if _keep_unpacked():
@@ -294,6 +384,45 @@ def _local_db_candidates(file_path: str) -> List[str]:
     return list(dict.fromkeys(candidates))
 
 
+def _archive_db_file(path: str) -> bool:
+    """Rename a packed DB file to .bak, overwriting existing backup."""
+    if not os.path.exists(path):
+        return True
+    backup_path = f"{path}.bak"
+    try:
+        os.replace(path, backup_path)
+        logging.info("Archived packed database: %s -> %s", path, backup_path)
+        return True
+    except OSError:
+        logging.warning("Could not archive packed database: %s", path, exc_info=True)
+        return False
+
+
+def _cleanup_stale_packed_dbs(file_path: str) -> List[str]:
+    """Archive stale packed DBs when running in unpacked mode.
+
+    Rename .i64/.idb to .bak (overwrite existing .bak). Returns any packed
+    DB paths that still exist (e.g. permission denied).
+    """
+    leftovers: List[str] = []
+    archived: List[str] = []
+    for candidate in _local_db_candidates(file_path):
+        if not os.path.exists(candidate):
+            continue
+        if _archive_db_file(candidate):
+            archived.append(candidate)
+        else:
+            leftovers.append(candidate)
+    if archived:
+        logging.info("Archived stale packed databases: %s", ", ".join(archived))
+    if leftovers:
+        logging.warning(
+            "Could not archive stale packed databases (likely locked): %s",
+            ", ".join(leftovers),
+        )
+    return leftovers
+
+
 def _is_ida_database_path(file_path: str) -> bool:
     return os.path.splitext(file_path)[1].lower() in {".i64", ".idb"}
 
@@ -323,10 +452,15 @@ def _convert_packed_to_unpacked(i64_path: str) -> None:
     """
     logging.info("Converting packed database to unpacked: %s", i64_path)
     script_path = None
+    ida_log_path = None
     try:
         script_path = os.path.join(
             tempfile.gettempdir(),
             f"ida_convert_unpack_{uuid.uuid4().hex}.py",
+        )
+        ida_log_path = os.path.join(
+            tempfile.gettempdir(),
+            f"ida_convert_unpack_{uuid.uuid4().hex}.log",
         )
         with open(script_path, "w", encoding="utf-8") as handle:
             handle.write("import idc\nidc.qexit(1)\n")
@@ -334,6 +468,7 @@ def _convert_packed_to_unpacked(i64_path: str) -> None:
         cmd = [
             IDAT64_PATH,
             "-A",
+            f"-L{ida_log_path}",
             "-P-",
             f'-S"{script_path}"',
             i64_path,
@@ -348,6 +483,7 @@ def _convert_packed_to_unpacked(i64_path: str) -> None:
                 timeout=IDA_BUILD_TIMEOUT,
                 shell=False,
                 text=True,
+                env=_build_ida_subprocess_env(),
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(
@@ -355,12 +491,17 @@ def _convert_packed_to_unpacked(i64_path: str) -> None:
             ) from exc
 
         if result.returncode not in (0, 1):
-            details = _format_process_error_output(result.stdout, result.stderr)
+            details = _format_process_error_output(
+                result.stdout,
+                result.stderr,
+                ida_log_path=ida_log_path,
+            )
             raise RuntimeError(
                 f"IDA conversion failed with exit code {result.returncode}{details}"
             )
     finally:
         _cleanup_file(script_path)
+        _cleanup_file(ida_log_path)
 
 
 def _move_unpacked_files(src_base: str, dst_base: str) -> None:
@@ -387,10 +528,15 @@ def _generate_unpacked_db(file_path: str) -> str:
     """Generate an unpacked database directly (no .i64 container)."""
     logging.info("Generating unpacked database for: %s", file_path)
     script_path = None
+    ida_log_path = None
     try:
         script_path = os.path.join(
             tempfile.gettempdir(),
             f"ida_build_unpacked_{uuid.uuid4().hex}.py",
+        )
+        ida_log_path = os.path.join(
+            tempfile.gettempdir(),
+            f"ida_build_unpacked_{uuid.uuid4().hex}.log",
         )
         with open(script_path, "w", encoding="utf-8") as handle:
             handle.write(
@@ -401,6 +547,7 @@ def _generate_unpacked_db(file_path: str) -> str:
         cmd = [
             IDAT64_PATH,
             "-A",
+            f"-L{ida_log_path}",
             "-P-",
             f'-S"{script_path}"',
             file_path,
@@ -415,6 +562,7 @@ def _generate_unpacked_db(file_path: str) -> str:
                 timeout=IDA_BUILD_TIMEOUT,
                 shell=False,
                 text=True,
+                env=_build_ida_subprocess_env(),
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(
@@ -423,22 +571,27 @@ def _generate_unpacked_db(file_path: str) -> str:
             ) from exc
 
         if result.returncode not in (0, 1):
-            details = _format_process_error_output(result.stdout, result.stderr)
+            details = _format_process_error_output(
+                result.stdout,
+                result.stderr,
+                ida_log_path=ida_log_path,
+            )
             raise RuntimeError(
                 f"IDA analysis failed with exit code {result.returncode}{details}"
             )
     finally:
         _cleanup_file(script_path)
+        _cleanup_file(ida_log_path)
 
     if not _unpacked_db_exists(file_path):
         raise FileNotFoundError(
             f"Unpacked database not generated. Expected: {file_path}.id0"
         )
 
-    # Clean up any .i64 that IDA might have created alongside
+    # Archive any .i64/.idb that IDA might have created alongside
     for candidate in _local_db_candidates(file_path):
         if os.path.exists(candidate):
-            _cleanup_file(candidate)
+            _archive_db_file(candidate)
 
     logging.info("Unpacked database generated for: %s", file_path)
     return file_path
@@ -454,10 +607,15 @@ def _generate_i64(file_path: str, cache_path: str) -> str:
     # Use an explicit script + qexit(1) to save DB and exit, which avoids
     # generating massive .asm outputs from -B for large binaries.
     script_path = None
+    ida_log_path = None
     try:
         script_path = os.path.join(
             tempfile.gettempdir(),
             f"ida_build_i64_{uuid.uuid4().hex}.py"
+        )
+        ida_log_path = os.path.join(
+            tempfile.gettempdir(),
+            f"ida_build_i64_{uuid.uuid4().hex}.log",
         )
         with open(script_path, "w", encoding="utf-8") as handle:
             handle.write(
@@ -470,6 +628,7 @@ def _generate_i64(file_path: str, cache_path: str) -> str:
         cmd = [
             IDAT64_PATH,
             "-A",
+            f"-L{ida_log_path}",
             f'-S"{script_path}"',
             f"-o{cache_path}",
             file_path,
@@ -485,6 +644,7 @@ def _generate_i64(file_path: str, cache_path: str) -> str:
                 timeout=IDA_BUILD_TIMEOUT,
                 shell=False,
                 text=True,
+                env=_build_ida_subprocess_env(),
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(
@@ -494,12 +654,17 @@ def _generate_i64(file_path: str, cache_path: str) -> str:
 
         # idc.qexit(1) indicates successful save-and-exit. Accept both 0/1.
         if result.returncode not in (0, 1):
-            details = _format_process_error_output(result.stdout, result.stderr)
+            details = _format_process_error_output(
+                result.stdout,
+                result.stderr,
+                ida_log_path=ida_log_path,
+            )
             raise RuntimeError(
                 f"IDA analysis failed with exit code {result.returncode}{details}"
             )
     finally:
         _cleanup_file(script_path)
+        _cleanup_file(ida_log_path)
 
     if not os.path.exists(cache_path):
         raise FileNotFoundError(f"i64 not generated at: {cache_path}")
@@ -514,72 +679,83 @@ def ensure_i64(file_path: str) -> str:
 
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"Target file not found: {file_path}")
+    db_lock = _get_db_lock(file_path)
+    with db_lock:
+        # --- Unpacked database mode ------------------------------------------
+        if _keep_unpacked():
+            # When user passes a .i64/.idb directly, use it with -P- (partial
+            # optimisation: avoids re-packing on exit but still needs one unpack).
+            if _is_ida_database_path(file_path):
+                show_message("ensure_i64", f"Unpacked mode: .i64 passed directly, using as-is: {file_path}")
+                return file_path
 
-    # --- Unpacked database mode ------------------------------------------
-    if _keep_unpacked():
-        # When user passes a .i64/.idb directly, use it with -P- (partial
-        # optimisation: avoids re-packing on exit but still needs one unpack).
-        if _is_ida_database_path(file_path):
-            show_message("ensure_i64", f"Unpacked mode: .i64 passed directly, using as-is: {file_path}")
-            return file_path
+            # Fast path: unpacked component files already next to the binary
+            if _unpacked_db_exists(file_path):
+                show_message("ensure_i64", f"Unpacked DB found: {file_path}")
+                logging.info("Found existing unpacked database for: %s", file_path)
+                leftovers = _cleanup_stale_packed_dbs(file_path)
+                if leftovers:
+                    # If packed DB can't be archived (e.g. locked), opening the
+                    # packed path is still safer than triggering the "overwrite DB"
+                    # prompt by opening the raw binary path.
+                    return leftovers[0]
+                return file_path
 
-        # Fast path: unpacked component files already next to the binary
-        if _unpacked_db_exists(file_path):
-            show_message("ensure_i64", f"Unpacked DB found: {file_path}")
-            logging.info("Found existing unpacked database for: %s", file_path)
-            return file_path
+            # Check for local packed databases that can be converted
+            for local_db in _local_db_candidates(file_path):
+                if os.path.exists(local_db):
+                    show_message("ensure_i64", f"Converting local .i64 to unpacked: {local_db}")
+                    try:
+                        _convert_packed_to_unpacked(local_db)
+                        if _unpacked_db_exists(file_path):
+                            _archive_db_file(local_db)
+                            _cleanup_stale_packed_dbs(file_path)
+                            return file_path
+                    except Exception:
+                        logging.warning("Failed to convert %s, falling back", local_db, exc_info=True)
+                    break
 
-        # Check for local packed databases that can be converted
-        for local_db in _local_db_candidates(file_path):
-            if os.path.exists(local_db):
-                show_message("ensure_i64", f"Converting local .i64 to unpacked: {local_db}")
+            # Check cache directory for packed database to convert
+            cache_path = _cache_i64_path(file_path)
+            if os.path.exists(cache_path):
+                show_message("ensure_i64", f"Converting cached .i64 to unpacked: {cache_path}")
                 try:
-                    _convert_packed_to_unpacked(local_db)
+                    _convert_packed_to_unpacked(cache_path)
+                    cache_base = _strip_i64_ext(cache_path)
+                    _move_unpacked_files(cache_base, file_path)
+                    _archive_db_file(cache_path)
                     if _unpacked_db_exists(file_path):
-                        _cleanup_file(local_db)
+                        _cleanup_stale_packed_dbs(file_path)
                         return file_path
                 except Exception:
-                    logging.warning("Failed to convert %s, falling back", local_db, exc_info=True)
-                break
+                    logging.warning("Failed to convert cached %s, falling back", cache_path, exc_info=True)
 
-        # Check cache directory for packed database to convert
+            # Generate a fresh unpacked database
+            show_message("ensure_i64", "Generating new unpacked database (first time, will take a while)...")
+            result_path = _generate_unpacked_db(file_path)
+            _cleanup_stale_packed_dbs(file_path)
+            return result_path
+
+        # --- Standard packed database mode -----------------------------------
+        if _is_ida_database_path(file_path):
+            show_message("ensure_i64", f"Input is IDA DB, use directly: {file_path}")
+            return file_path
+
+        for local_db in _local_db_candidates(file_path):
+            exists = os.path.exists(local_db)
+            show_message("ensure_i64", f"Check local DB: {local_db}\nExists: {exists}")
+            if exists:
+                return local_db
+
         cache_path = _cache_i64_path(file_path)
+        show_message(
+            "ensure_i64", f"Check cache: {cache_path}\nExists: {os.path.exists(cache_path)}")
         if os.path.exists(cache_path):
-            show_message("ensure_i64", f"Converting cached .i64 to unpacked: {cache_path}")
-            try:
-                _convert_packed_to_unpacked(cache_path)
-                cache_base = _strip_i64_ext(cache_path)
-                _move_unpacked_files(cache_base, file_path)
-                _cleanup_file(cache_path)
-                if _unpacked_db_exists(file_path):
-                    return file_path
-            except Exception:
-                logging.warning("Failed to convert cached %s, falling back", cache_path, exc_info=True)
+            return cache_path
 
-        # Generate a fresh unpacked database
-        show_message("ensure_i64", "Generating new unpacked database (first time, will take a while)...")
-        return _generate_unpacked_db(file_path)
-
-    # --- Standard packed database mode -----------------------------------
-    if _is_ida_database_path(file_path):
-        show_message("ensure_i64", f"Input is IDA DB, use directly: {file_path}")
-        return file_path
-
-    for local_db in _local_db_candidates(file_path):
-        exists = os.path.exists(local_db)
-        show_message("ensure_i64", f"Check local DB: {local_db}\nExists: {exists}")
-        if exists:
-            return local_db
-
-    cache_path = _cache_i64_path(file_path)
-    show_message(
-        "ensure_i64", f"Check cache: {cache_path}\nExists: {os.path.exists(cache_path)}")
-    if os.path.exists(cache_path):
-        return cache_path
-
-    show_message(
-        "ensure_i64", f"Need to generate i64!\nThis will take time...")
-    return _generate_i64(file_path, cache_path)
+        show_message(
+            "ensure_i64", f"Need to generate i64!\nThis will take time...")
+        return _generate_i64(file_path, cache_path)
 
 
 def _create_shared_memory() -> str:
@@ -608,12 +784,39 @@ def _cleanup_file(path: Optional[str]) -> None:
             logging.warning("Failed to remove file: %s", path)
 
 
-def _format_process_error_output(stdout: str, stderr: str, lines: int = 20) -> str:
+def _read_text_tail(path: Optional[str], lines: int = 20) -> str:
+    if not path or not os.path.exists(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+            content = handle.read().strip()
+    except OSError:
+        return ""
+    if not content:
+        return ""
+    return "\n".join(content.splitlines()[-lines:])
+
+
+def _format_process_error_output(
+    stdout: str,
+    stderr: str,
+    lines: int = 20,
+    ida_log_path: Optional[str] = None,
+) -> str:
     parts: List[str] = []
     if stderr and stderr.strip():
         parts.append("stderr:\n" + "\n".join(stderr.strip().splitlines()[-lines:]))
     if stdout and stdout.strip():
         parts.append("stdout:\n" + "\n".join(stdout.strip().splitlines()[-lines:]))
+    ida_log_tail = _read_text_tail(ida_log_path, lines=lines)
+    if ida_log_tail:
+        parts.append("ida_log:\n" + ida_log_tail)
+    if "WPeChatGPT" in stdout or "WPeChatGPT" in stderr:
+        parts.append(
+            "hint:\nDetected third-party IDA plugin output (WPeChatGPT). "
+            "Headless mode can fail if startup plugins interfere. "
+            "Try IDA_ISOLATE_USER_DIR=1 (enabled by default) or remove that plugin."
+        )
     if not parts:
         return ""
     return "\n" + "\n\n".join(parts)
@@ -636,16 +839,24 @@ def _run_ida_script(
         script_content = script_content.replace("idc.qexit(0)", "idc.qexit(1)")
 
     script_path = None
+    ida_log_path = None
+    db_lock = _get_db_lock(idb_path)
+    db_lock.acquire()
     try:
         script_path = os.path.join(
             tempfile.gettempdir(),
             f"ida_script_{uuid.uuid4().hex}.py"
+        )
+        ida_log_path = os.path.join(
+            tempfile.gettempdir(),
+            f"ida_script_{uuid.uuid4().hex}.log",
         )
         with open(script_path, "w", encoding="utf-8") as handle:
             handle.write(script_content)
         cmd = [
             IDAT64_PATH,
             "-A",
+            f"-L{ida_log_path}",
         ]
         if unpacked:
             cmd.append("-P-")
@@ -661,6 +872,7 @@ def _run_ida_script(
                 shell=False,
                 check=False,
                 text=True,
+                env=_build_ida_subprocess_env(),
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(
@@ -671,19 +883,63 @@ def _run_ida_script(
                 f"analysis queues."
             ) from exc
         if result.returncode not in (0, 1):
-            details = _format_process_error_output(result.stdout, result.stderr)
+            # Some third-party plugins can force a non-zero exit code even when
+            # our script already produced a valid JSON payload.
+            try:
+                recovered = _read_shared_memory(shm_path)
+                if isinstance(recovered, dict):
+                    recovered.setdefault(
+                        "_warning",
+                        f"IDA returned exit code {result.returncode}, but script output was recovered from shared memory.",
+                    )
+                    recovered.setdefault("_ida_exit_code", result.returncode)
+                logging.warning(
+                    "IDA exited with code %s, but shared memory contained valid data. Returning recovered payload.",
+                    result.returncode,
+                )
+                return recovered
+            except Exception:
+                pass
+
+            details = _format_process_error_output(
+                result.stdout,
+                result.stderr,
+                ida_log_path=ida_log_path,
+            )
             raise RuntimeError(
                 f"IDA script failed with exit code {result.returncode}{details}"
             )
 
-        return _read_shared_memory(shm_path)
-
+        try:
+            return _read_shared_memory(shm_path)
+        except Exception as read_exc:
+            details = _format_process_error_output(
+                result.stdout,
+                result.stderr,
+                ida_log_path=ida_log_path,
+            )
+            raise RuntimeError(
+                f"IDA finished with exit code {result.returncode}, but result payload is invalid: "
+                f"{read_exc}{details}"
+            ) from read_exc
     finally:
         _cleanup_file(script_path)
         _cleanup_file(shm_path)
+        _cleanup_file(ida_log_path)
+        db_lock.release()
+
+
+def _offload_to_thread(fn):
+    """Wrap a sync MCP tool so it runs in a worker thread, keeping the
+    event loop free to answer pings / list-tools while IDA is running."""
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        return await asyncio.to_thread(fn, *args, **kwargs)
+    return wrapper
 
 
 @mcp.tool()
+@_offload_to_thread
 def ping() -> str:
     """
     Simple ping test to verify MCP connection.
@@ -704,6 +960,7 @@ def ping() -> str:
 
 
 @mcp.tool()
+@_offload_to_thread
 def stop_auto_analysis(
     file_path: Annotated[str, "Target binary file path (same as other tools)"],
     save_idb: Annotated[
@@ -740,6 +997,7 @@ def stop_auto_analysis(
 
 
 @mcp.tool()
+@_offload_to_thread
 def list_strings(
     file_path: Annotated[str, "Target binary file path"],
     count: Annotated[int, "Max number of strings, 0 means unlimited"] = 0,
@@ -800,6 +1058,7 @@ def list_strings(
 
 
 @mcp.tool()
+@_offload_to_thread
 def disassemble_function(
     file_path: Annotated[str, "Target binary file path"],
     address: Annotated[str, "Hex or decimal address string (e.g. 0x14001e2a0)"],
@@ -833,6 +1092,7 @@ def disassemble_function(
 
 
 @mcp.tool()
+@_offload_to_thread
 def decompile_function(
     file_path: Annotated[str, "Target binary file path"],
     address: Annotated[str, "Hex or decimal address string (e.g. 0x14001e2a0)"],
@@ -866,6 +1126,57 @@ def decompile_function(
 
 
 @mcp.tool()
+@_offload_to_thread
+def batch_decompile_funcs(
+    file_path: Annotated[str, "Target binary file path"],
+    targets: Annotated[
+        List[str],
+        "List of function addresses (hex/decimal) or function names",
+    ],
+    deduplicate: Annotated[
+        bool,
+        "If true, decompile each resolved function start once per batch",
+    ] = True,
+) -> str:
+    """
+    Decompile multiple functions in a single IDA run.
+
+    Use this instead of calling decompile_function repeatedly on the same DB.
+    """
+    try:
+        logging.info(
+            "batch_decompile_funcs called: file_path=%s targets=%d deduplicate=%s",
+            file_path,
+            len(targets or []),
+            deduplicate,
+        )
+        _setup_logging()
+        _ensure_paths()
+        normalized_targets = [str(t).strip() for t in (targets or []) if str(t).strip()]
+        if not normalized_targets:
+            return json.dumps(
+                {"success": False, "error": "targets is empty"},
+                ensure_ascii=False,
+                indent=2,
+            )
+        idb_path = ensure_i64(os.path.abspath(file_path))
+        shm_path = _create_shared_memory()
+        script = script_batch_decompile_functions(
+            shm_path=shm_path,
+            targets=normalized_targets,
+            deduplicate=deduplicate,
+        )
+        data = _run_ida_script(idb_path, script, shm_path)
+        logging.info("batch_decompile_funcs completed successfully")
+        return json.dumps(data, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error("batch_decompile_funcs failed: %s", str(e), exc_info=True)
+        error_result = {"success": False, "error": str(e)}
+        return json.dumps(error_result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+@_offload_to_thread
 def list_functions(
     file_path: Annotated[str, "Target binary file path"],
     offset: Annotated[int, "Start offset for pagination"] = 0,
@@ -902,6 +1213,7 @@ def list_functions(
 
 
 @mcp.tool()
+@_offload_to_thread
 def get_function_info(
     file_path: Annotated[str, "Target binary file path"],
     address: Annotated[str, "Hex or decimal address string (e.g. 0x14001e2a0)"],
@@ -934,6 +1246,7 @@ def get_function_info(
 
 
 @mcp.tool()
+@_offload_to_thread
 def list_imports(
     file_path: Annotated[str, "Target binary file path"],
     offset: Annotated[int, "Start offset for pagination"] = 0,
@@ -968,6 +1281,7 @@ def list_imports(
 
 
 @mcp.tool()
+@_offload_to_thread
 def xrefs_to(
     file_path: Annotated[str, "Target binary file path"],
     addresses: Annotated[
@@ -1003,6 +1317,7 @@ def xrefs_to(
 
 
 @mcp.tool()
+@_offload_to_thread
 def get_callees(
     file_path: Annotated[str, "Target binary file path"],
     address: Annotated[str, "Hex or decimal address string (e.g. 0x14001e2a0)"],
@@ -1035,6 +1350,7 @@ def get_callees(
 
 
 @mcp.tool()
+@_offload_to_thread
 def read_bytes(
     file_path: Annotated[str, "Target binary file path"],
     address: Annotated[str, "Hex or decimal address string (e.g. 0x404000)"],
@@ -1074,6 +1390,7 @@ def read_bytes(
 # ============================================================================
 
 @mcp.tool()
+@_offload_to_thread
 def basic_blocks(
     file_path: Annotated[str, "Target binary file path"],
     address: Annotated[str, "Hex or decimal function address"],
@@ -1106,6 +1423,7 @@ def basic_blocks(
 
 
 @mcp.tool()
+@_offload_to_thread
 def find_bytes(
     file_path: Annotated[str, "Target binary file path"],
     pattern: Annotated[str, "Hex pattern with wildcards (e.g. '48 8B ? C3')"],
@@ -1143,6 +1461,7 @@ def find_bytes(
 
 
 @mcp.tool()
+@_offload_to_thread
 def find(
     file_path: Annotated[str, "Target binary file path"],
     value: Annotated[str, "Immediate value to search for (hex or decimal)"],
@@ -1162,7 +1481,23 @@ def find(
         _setup_logging()
         _ensure_paths()
         idb_path = ensure_i64(os.path.abspath(file_path))
-        search_val = int(value, 0)
+        try:
+            search_val = int(value, 0)
+        except Exception:
+            hint_hex = " ".join(f"{b:02X}" for b in str(value).encode("utf-8"))
+            error_result = {
+                "success": False,
+                "error": (
+                    "find only supports immediate numeric values (hex/decimal). "
+                    "For text search, use find_regex (pattern) or find_bytes (hex pattern)."
+                ),
+                "input": value,
+                "suggestions": {
+                    "find_regex_pattern": str(value),
+                    "find_bytes_utf8_hex_pattern": hint_hex,
+                },
+            }
+            return json.dumps(error_result, ensure_ascii=False, indent=2)
         shm_path = _create_shared_memory()
         script = script_find(shm_path, search_val)
         data = _run_ida_script(idb_path, script, shm_path)
@@ -1175,6 +1510,7 @@ def find(
 
 
 @mcp.tool()
+@_offload_to_thread
 def export_funcs(
     file_path: Annotated[str, "Target binary file path"],
     count: Annotated[int, "Max exports to return (0 = unlimited)"] = 100,
@@ -1206,6 +1542,7 @@ def export_funcs(
 
 
 @mcp.tool()
+@_offload_to_thread
 def callgraph(
     file_path: Annotated[str, "Target binary file path"],
     address: Annotated[str, "Hex or decimal function address"],
@@ -1238,6 +1575,7 @@ def callgraph(
 
 
 @mcp.tool()
+@_offload_to_thread
 def find_regex(
     file_path: Annotated[str, "Target binary file path"],
     pattern: Annotated[str, "Regex pattern to search strings"],
@@ -1271,6 +1609,7 @@ def find_regex(
 
 
 @mcp.tool()
+@_offload_to_thread
 def lookup_funcs(
     file_path: Annotated[str, "Target binary file path"],
     queries: Annotated[
@@ -1309,6 +1648,7 @@ def lookup_funcs(
 # ============================================================================
 
 @mcp.tool()
+@_offload_to_thread
 def list_globals(
     file_path: Annotated[str, "Target binary file path"],
     offset: Annotated[int, "Pagination offset"] = 0,
@@ -1345,6 +1685,7 @@ def list_globals(
 
 
 @mcp.tool()
+@_offload_to_thread
 def int_convert(
     numbers: Annotated[
         list[dict],
@@ -1400,6 +1741,7 @@ def int_convert(
 # ============================================================================
 
 @mcp.tool()
+@_offload_to_thread
 def get_int(
     file_path: Annotated[str, "Target binary file path"],
     queries: Annotated[
@@ -1435,6 +1777,7 @@ def get_int(
 
 
 @mcp.tool()
+@_offload_to_thread
 def get_string(
     file_path: Annotated[str, "Target binary file path"],
     addresses: Annotated[
@@ -1469,6 +1812,7 @@ def get_string(
 
 
 @mcp.tool()
+@_offload_to_thread
 def get_global_value(
     file_path: Annotated[str, "Target binary file path"],
     names: Annotated[
@@ -1503,6 +1847,7 @@ def get_global_value(
 
 
 @mcp.tool()
+@_offload_to_thread
 def patch(
     file_path: Annotated[str, "Target binary file path"],
     patches: Annotated[
@@ -1537,6 +1882,7 @@ def patch(
 
 
 @mcp.tool()
+@_offload_to_thread
 def put_int(
     file_path: Annotated[str, "Target binary file path"],
     writes: Annotated[
@@ -1575,6 +1921,7 @@ def put_int(
 # ============================================================================
 
 @mcp.tool()
+@_offload_to_thread
 def set_comments(
     file_path: Annotated[str, "Target binary file path (opens/creates cached .i64 like other tools)"],
     items: Annotated[
@@ -1600,6 +1947,7 @@ def set_comments(
         return json.dumps({"success": False, "error": str(e)}, indent=2)
 
 @mcp.tool()
+@_offload_to_thread
 def patch_asm(
     file_path: Annotated[str, "Target binary file path"],
     items: Annotated[
@@ -1625,6 +1973,7 @@ def patch_asm(
         return json.dumps({"success": False, "error": str(e)}, indent=2)
 
 @mcp.tool()
+@_offload_to_thread
 def rename(
     file_path: Annotated[str, "Target binary file path"],
     batch: Annotated[
@@ -1683,6 +2032,7 @@ def rename(
         return json.dumps({"success": False, "error": str(e)}, indent=2)
 
 @mcp.tool()
+@_offload_to_thread
 def stack_frame(
     file_path: Annotated[str, "Target binary file path"],
     address: Annotated[
@@ -1706,6 +2056,7 @@ def stack_frame(
         return json.dumps({"success": False, "error": str(e)}, indent=2)
 
 @mcp.tool()
+@_offload_to_thread
 def declare_stack(
     file_path: Annotated[str, "Target binary file path"],
     func_addr: Annotated[str, "Function entry EA (hex or decimal string)"],
@@ -1727,6 +2078,7 @@ def declare_stack(
         return json.dumps({"success": False, "error": str(e)}, indent=2)
 
 @mcp.tool()
+@_offload_to_thread
 def delete_stack(
     file_path: Annotated[str, "Target binary file path"],
     func_addr: Annotated[str, "Function entry EA (hex or decimal string)"],
@@ -1746,6 +2098,7 @@ def delete_stack(
         return json.dumps({"success": False, "error": str(e)}, indent=2)
 
 @mcp.tool()
+@_offload_to_thread
 def declare_type(
     file_path: Annotated[str, "Target binary file path"],
     decls: Annotated[
@@ -1767,6 +2120,7 @@ def declare_type(
         return json.dumps({"success": False, "error": str(e)}, indent=2)
 
 @mcp.tool()
+@_offload_to_thread
 def read_struct(
     file_path: Annotated[str, "Target binary file path"],
     queries: Annotated[
@@ -1788,6 +2142,7 @@ def read_struct(
         return json.dumps({"success": False, "error": str(e)}, indent=2)
 
 @mcp.tool()
+@_offload_to_thread
 def search_structs(
     file_path: Annotated[str, "Target binary file path"],
     pattern: Annotated[
@@ -1808,6 +2163,7 @@ def search_structs(
         return json.dumps({"success": False, "error": str(e)}, indent=2)
 
 @mcp.tool()
+@_offload_to_thread
 def set_type(
     file_path: Annotated[str, "Target binary file path"],
     items: Annotated[
@@ -1829,6 +2185,7 @@ def set_type(
         return json.dumps({"success": False, "error": str(e)}, indent=2)
 
 @mcp.tool()
+@_offload_to_thread
 def infer_types(
     file_path: Annotated[str, "Reserved for future use; currently ignored"],
     address: Annotated[str, "Reserved for future use; currently ignored"],
@@ -1897,7 +2254,8 @@ def install_mcp_servers(ida_path: str, idat_path: str) -> int:
             "IDA_TIMEOUT": "120",
             "IDA_BUILD_TIMEOUT": "1800",
             "IDA_SHM_SIZE": "20971520",
-            "IDA_KEEP_UNPACKED": "0"
+            "IDA_KEEP_UNPACKED": "0",
+            "IDA_ISOLATE_USER_DIR": "1",
         },
         "timeout": 1800,
         "disabled": False,
@@ -2021,7 +2379,8 @@ Documentation: https://github.com/GameSecurityFrontierLib/ida-pro-mcp-plus
                         "I64_CACHE_DIR": ".i64_cache",
                         "IDA_TIMEOUT": "120",
                         "IDA_BUILD_TIMEOUT": "1800",
-                        "IDA_KEEP_UNPACKED": "0"
+                        "IDA_KEEP_UNPACKED": "0",
+                        "IDA_ISOLATE_USER_DIR": "1"
                     },
                     "timeout": 1800,
                     "disabled": False
@@ -2034,6 +2393,7 @@ Documentation: https://github.com/GameSecurityFrontierLib/ida-pro-mcp-plus
     
     # Default: Run MCP server
     _setup_logging()
+    _patch_mcp_request_responder_race()
     _log_configuration()
     _ensure_paths()
     logging.info("Path validation successful - Server ready to accept requests")

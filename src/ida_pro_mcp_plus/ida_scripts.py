@@ -39,6 +39,7 @@ def script_list_strings(shm_path: str, count: int) -> str:
     return f"""
 import idaapi
 import idautils
+import idc
 import json
 import mmap
 
@@ -49,21 +50,31 @@ idaapi.auto_wait()
 
 result = {{"success": True, "strings": []}}
 
-for index, s in enumerate(idautils.Strings()):
-    if MAX_COUNT and index >= MAX_COUNT:
-        break
-    value = str(s)
-    result["strings"].append({{
-        "ea": hex(s.ea),
-        "string": value,
-        "length": len(value)
-    }})
+try:
+    strings = idautils.Strings()
+    try:
+        strings.setup()
+    except Exception:
+        # Older/newer IDA builds may not require setup()
+        pass
+
+    for index, s in enumerate(strings):
+        if MAX_COUNT and index >= MAX_COUNT:
+            break
+        value = str(s)
+        result["strings"].append({{
+            "ea": hex(s.ea),
+            "string": value,
+            "length": len(value)
+        }})
+except Exception as e:
+    result["success"] = False
+    result["error"] = str(e)
 
 with open(SHARED_MEM_PATH, "r+b") as handle:
     with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_WRITE) as mm:
         mm.write(json.dumps(result, ensure_ascii=False).encode("utf-8"))
 
-import idc
 idc.qexit(0)
 """
 
@@ -186,6 +197,121 @@ with open(SHARED_MEM_PATH, "r+b") as handle:
 idc.qexit(0)
 """
     return script_template % {"shm_path": shm_path, "address": address}
+
+
+def script_batch_decompile_functions(
+    shm_path: str,
+    targets: list[str],
+    deduplicate: bool = True,
+) -> str:
+    """
+    Generate IDA script to decompile multiple functions in one IDA run.
+
+    Args:
+        shm_path: Path to shared memory file for results
+        targets: List of hex/decimal addresses or function names
+        deduplicate: If true, decompile each resolved function start once
+
+    Returns:
+        Complete IDA Python script as string
+    """
+    script_template = r"""
+import idaapi
+import idc
+import json
+import mmap
+
+SHARED_MEM_PATH = __SHM_PATH__
+TARGETS = __TARGETS__
+DEDUPLICATE = __DEDUP__
+
+idaapi.auto_wait()
+
+result = {"success": True, "functions": [], "requested_count": len(TARGETS)}
+seen_funcs = set()
+
+def _resolve_target(raw):
+    text = str(raw).strip()
+    if not text:
+        return idaapi.BADADDR, "Empty target"
+    try:
+        return int(text, 0), None
+    except Exception:
+        pass
+    ea = idc.get_name_ea_simple(text)
+    if ea == idaapi.BADADDR:
+        return idaapi.BADADDR, "Target not found: " + text
+    return ea, None
+
+for raw_target in TARGETS:
+    item = {"query": str(raw_target)}
+    ea, resolve_error = _resolve_target(raw_target)
+    if resolve_error:
+        item["success"] = False
+        item["error"] = resolve_error
+        result["functions"].append(item)
+        continue
+
+    item["resolved_ea"] = hex(ea)
+    func = idaapi.get_func(ea)
+    if not func:
+        item["success"] = False
+        item["error"] = "No function found for target " + str(raw_target)
+        result["functions"].append(item)
+        continue
+
+    func_start = func.start_ea
+    item["function_start"] = hex(func_start)
+    item["function_name"] = idc.get_func_name(func_start)
+    item["function_size"] = hex(func.end_ea - func.start_ea)
+
+    if DEDUPLICATE and func_start in seen_funcs:
+        item["success"] = True
+        item["skipped"] = True
+        item["reason"] = "Duplicate function start"
+        result["functions"].append(item)
+        continue
+
+    seen_funcs.add(func_start)
+
+    try:
+        cfunc = idaapi.decompile(func_start)
+        if cfunc:
+            item["success"] = True
+            item["pseudocode"] = str(cfunc)
+        else:
+            item["success"] = False
+            item["error"] = "Decompilation failed for function " + item["function_name"]
+    except Exception as e:
+        item["success"] = False
+        item["error"] = "Decompilation error: " + str(e)
+
+    result["functions"].append(item)
+
+result["returned_count"] = len(result["functions"])
+result["decompiled_count"] = len(
+    [f for f in result["functions"] if f.get("success") and not f.get("skipped")]
+)
+result["failed_count"] = len([f for f in result["functions"] if not f.get("success")])
+
+if result["requested_count"] == 0:
+    result["success"] = False
+    result["error"] = "No targets provided"
+elif result["decompiled_count"] == 0 and result["failed_count"] > 0:
+    result["success"] = False
+
+with open(SHARED_MEM_PATH, "r+b") as handle:
+    with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_WRITE) as mm:
+        mm.write(json.dumps(result, ensure_ascii=False).encode("utf-8"))
+
+idc.qexit(0)
+"""
+    return (
+        script_template
+        .replace("__SHM_PATH__", repr(shm_path))
+        .replace("__TARGETS__", repr([str(t) for t in targets]))
+        .replace("__DEDUP__", "True" if deduplicate else "False")
+    )
 
 
 def script_list_functions(shm_path: str, offset: int, count: int, filter_pattern: str) -> str:

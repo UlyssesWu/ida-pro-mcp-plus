@@ -88,69 +88,43 @@ def script_find_bytes(shm_path: str, pattern: str, start_ea: int, end_ea: int) -
     """
     return f"""
 import idaapi
-import ida_bytes
+import idc
 import json
 import mmap
 
 SHARED_MEM_PATH = r"{shm_path}"
-PATTERN = "{pattern}"
+PATTERN = r"{pattern}"
 START_EA = {start_ea}
 END_EA = {end_ea}
 
-# IDA 9.x: BIN_SEARCH_* lives in ida_bytes (optional BIN_SEARCH_NOSHOW). IDA 7.x: some builds only expose it on ida_search.
-_fwd = getattr(ida_bytes, "BIN_SEARCH_FORWARD", None)
-if _fwd is not None:
-    _SEARCH_FLAGS = _fwd | getattr(ida_bytes, "BIN_SEARCH_NOSHOW", 0)
-else:
-    import ida_search
-    _SEARCH_FLAGS = ida_search.BIN_SEARCH_FORWARD
-
-
-def _bin_search_compat(start_ea, end_ea, image, mask, pat_len, flags):
-    try:
-        return ida_bytes.bin_search(start_ea, end_ea, image, mask, pat_len, flags)
-    except TypeError:
-        if mask is not None:
-            return ida_bytes.bin_search(start_ea, end_ea, image, mask, flags)
-        return ida_bytes.bin_search(start_ea, end_ea, image, None, flags)
-
+SEARCH_DOWN = getattr(idc, "SEARCH_DOWN", 0x01)
+SEARCH_NEXT = getattr(idc, "SEARCH_NEXT", 0x02)
+SEARCH_NOSHOW = getattr(idc, "SEARCH_NOSHOW", 0x20)
 
 idaapi.auto_wait()
 
 result = {{"success": True, "matches": [], "pattern": PATTERN}}
 
 try:
-    # Convert pattern string to bytes for searching
-    pattern_parts = PATTERN.split()
-    search_bytes = []
-    mask_bytes = []
-    
-    for part in pattern_parts:
-        if part == '?':
-            search_bytes.append(0)
-            mask_bytes.append(0)
-        else:
-            search_bytes.append(int(part, 16))
-            mask_bytes.append(0xFF)
-    
-    pattern_bytes = bytes(search_bytes)
-    mask = bytes(mask_bytes) if 0 in mask_bytes else None
-    pat_len = len(pattern_bytes)
-    
     ea = START_EA
+    first = True
     while ea < END_EA:
-        ea = _bin_search_compat(ea, END_EA, pattern_bytes, mask, pat_len, _SEARCH_FLAGS)
-        
-        if ea == idaapi.BADADDR:
+        flags = SEARCH_DOWN | SEARCH_NOSHOW
+        if not first:
+            flags |= SEARCH_NEXT
+
+        hit = idc.find_binary(ea, flags, PATTERN)
+        if hit == idaapi.BADADDR or hit >= END_EA:
             break
-        
-        result["matches"].append(hex(ea))
-        ea += 1
-        
+
+        result["matches"].append(hex(hit))
         if len(result["matches"]) >= 1000:
             result["truncated"] = True
             break
-            
+
+        # Next search starts from current hit; SEARCH_NEXT advances internally.
+        ea = hit
+        first = False
 except Exception as e:
     result["success"] = False
     result["error"] = str(e)
@@ -159,7 +133,6 @@ with open(SHARED_MEM_PATH, "r+b") as handle:
     with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_WRITE) as mm:
         mm.write(json.dumps(result, ensure_ascii=False).encode("utf-8"))
 
-import idc
 idc.qexit(0)
 """
 
